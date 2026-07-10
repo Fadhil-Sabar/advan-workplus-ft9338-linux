@@ -1,0 +1,7 @@
+# proprietary blobs (fetched at build time, never committed)
+/blobs/
+/src/ft9201_fw.h
+# upstream libfprint checkout + build
+/libfprint/
+# misc
+*.o
