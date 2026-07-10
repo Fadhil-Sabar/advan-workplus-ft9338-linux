@@ -456,7 +456,12 @@ int ft_engine_open(const char *dll_path){
   return 0;
 }
 
-void ft_engine_close(void){ g_iface=0; }
+void ft_engine_close(void){
+  /* The engine maps at a fixed base and is loaded once per process; a libfprint
+   * device close/reopen must NOT tear it down (and must not clear g_iface, or the
+   * next open — which short-circuits on the load-once guard — leaves a null
+   * interface and the following engine call segfaults). Intentional no-op. */
+}
 
 uint32_t ft_engine_accept(const uint8_t *img,int sw,int sh,uint8_t purpose){
   set_gs(g_teb);   /* ensure %gs points at our TEB on this thread */
