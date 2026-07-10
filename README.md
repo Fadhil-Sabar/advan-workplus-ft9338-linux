@@ -35,8 +35,7 @@ Caveats:
   `fprintd`'s default `MemoryDenyWriteExecute` hardening — you do **not** have to
   disable any security settings.
 
-See [`docs/engine-abi.md`](docs/engine-abi.md) for the full reverse-engineering
-notes.
+See [`docs/how-it-works.md`](docs/how-it-works.md) for the full technical writeup.
 
 ## Requirements
 

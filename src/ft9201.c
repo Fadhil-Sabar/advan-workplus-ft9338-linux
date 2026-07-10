@@ -126,7 +126,6 @@ struct _FpiDeviceFt9201
   guint8    fw_chunk_buf[FW_CHUNK];
   guint     fw_offset;
   guint     fw_retries;
-  guint     diag_idx;
 };
 
 G_DECLARE_FINAL_TYPE (FpiDeviceFt9201, fpi_device_ft9201,
@@ -235,7 +234,6 @@ enum {
   INIT_RESET_DELAY,     /* 160 ms sleep */
   INIT_POST_WAKE1,      /* WakeupSensor 1 */
   INIT_POST_WAKE2,      /* WakeupSensor 2 */
-  INIT_DIAG_SWEEP,      /* FT9201_DIAG: read a range of AFE regs once, log them */
   INIT_MCU_WAIT,        /* 2 ms delay between polls */
   INIT_MCU_POLL,        /* read reg 0x20 len=2; loops back to MCU_WAIT if not ready */
 
@@ -318,12 +316,6 @@ mcu_poll_cb (FpiUsbTransfer *t, FpDevice *dev, gpointer ud, GError *err)
 
   if (err) { fpi_ssm_mark_failed (t->ssm, err); return; }
 
-  /* Diagnostic: show what the MCU status register actually returns. */
-  if (self->fw_retries == 0 || self->fw_retries % 40 == 0)
-    fp_warn ("ft9201: MCU poll #%u reg0x20 = %02x %02x %02x %02x",
-             self->fw_retries,
-             t->buffer[0], t->buffer[1], t->buffer[2], t->buffer[3]);
-
   if (t->buffer[0] == 0xa5 && t->buffer[1] == 0x5a)
     {
       fp_dbg ("ft9201: MCU ready after %u polls", self->fw_retries + 1);
@@ -342,26 +334,6 @@ mcu_poll_cb (FpiUsbTransfer *t, FpDevice *dev, gpointer ud, GError *err)
 
   /* wait 2 ms then try again */
   fpi_ssm_jump_to_state (t->ssm, INIT_MCU_WAIT);
-}
-
-/* ---- diagnostic register sweep (FT9201_DIAG=1) ---- */
-static const guint8 ft9201_diag_regs[] = {
-  0x00, 0x01, 0x14, 0x15, 0x1d, 0x1e, 0x1f, 0x20, 0x30, 0x85,
-};
-
-static void
-diag_sweep_cb (FpiUsbTransfer *t, FpDevice *dev, gpointer ud, GError *err)
-{
-  FpiDeviceFt9201 *self = FPI_DEVICE_FT9201 (dev);
-  if (err) { fpi_ssm_mark_failed (t->ssm, err); return; }
-  fp_warn ("ft9201: DIAG reg 0x%02x = %02x %02x %02x %02x",
-           ft9201_diag_regs[self->diag_idx],
-           t->buffer[0], t->buffer[1], t->buffer[2], t->buffer[3]);
-  self->diag_idx++;
-  if (self->diag_idx < G_N_ELEMENTS (ft9201_diag_regs))
-    fpi_ssm_jump_to_state (t->ssm, INIT_DIAG_SWEEP);   /* read next reg */
-  else
-    fpi_ssm_next_state (t->ssm);                       /* -> INIT_MCU_WAIT */
 }
 
 /* ---- dimension callbacks ---- */
@@ -537,24 +509,9 @@ init_ssm_run_state (FpiSsm *ssm, FpDevice *dev)
       ctrl_out (ssm, dev, REQ_AFE_WRITE, 0x01, 0x1e);
       break;
 
-    /* --- post-upload reset --- */
+    /* --- post-config reset that starts the uploaded firmware --- */
     case INIT_SENSOR_RESET:
-      /* req=0x40 is SensorReset — NOT req=0x22 which is WakeupSensor.
-       * Experiment knobs (post-firmware MCU comes up dead/00 00 with the reset):
-       *   FT9201_NO_RESET=1     → skip the reset entirely (reference driver never resets)
-       *   FT9201_RESET_VAL=<n>  → send the reset with wValue=n (e.g. 1 = release?) */
-      if (g_getenv ("FT9201_NO_RESET"))
-        {
-          fp_warn ("ft9201: FT9201_NO_RESET set — skipping SENSOR_RESET");
-          fpi_ssm_next_state (ssm);
-        }
-      else
-        {
-          const char *rv = g_getenv ("FT9201_RESET_VAL");
-          guint16 val = rv ? (guint16) g_ascii_strtoull (rv, NULL, 0) : 0;
-          fp_warn ("ft9201: SENSOR_RESET req=0x40 val=0x%x", val);
-          ctrl_out (ssm, dev, REQ_SENSOR_RESET, val, 0);
-        }
+      ctrl_out (ssm, dev, REQ_SENSOR_RESET, 0, 0);
       break;
     case INIT_RESET_DELAY:
       fpi_ssm_next_state_delayed (ssm, 160);
@@ -566,28 +523,12 @@ init_ssm_run_state (FpiSsm *ssm, FpDevice *dev)
       ctrl_out (ssm, dev, REQ_WAKEUP, 0x70, 0x70);
       break;
 
-    case INIT_DIAG_SWEEP:
-      if (!g_getenv ("FT9201_DIAG"))
-        {
-          fpi_ssm_next_state (ssm);
-          break;
-        }
-      ctrl_in (ssm, dev, REQ_AFE_READ, 0,
-               ft9201_diag_regs[self->diag_idx], 4, diag_sweep_cb);
-      break;
-
     case INIT_MCU_WAIT:
       fpi_ssm_next_state_delayed (ssm, 2);  /* 2 ms before next poll */
       break;
 
     case INIT_MCU_POLL:
-      {
-        /* Diagnostic: FT9201_STATUS_REG=<n> probes a different register than 0x20
-         * to find where the MCU reports life post-firmware. */
-        const char *sr = g_getenv ("FT9201_STATUS_REG");
-        guint16 reg = sr ? (guint16) g_ascii_strtoull (sr, NULL, 0) : REG_MCU_STATUS;
-        ctrl_in (ssm, dev, REQ_AFE_READ, 0, reg, 4, mcu_poll_cb);
-      }
+      ctrl_in (ssm, dev, REQ_AFE_READ, 0, REG_MCU_STATUS, 2, mcu_poll_cb);
       break;
 
     /* ---- dimension reads ---- */
@@ -701,8 +642,6 @@ static void
 wait_finger_cb (FpiUsbTransfer *t, FpDevice *dev, gpointer ud, GError *err)
 {
   if (err) { fpi_ssm_mark_failed (t->ssm, err); return; }
-
-  fp_dbg ("ft9201: reg 0x1d = 0x%02x (actual_length=%zd)", t->buffer[0], (ssize_t)t->actual_length);
 
   if (t->buffer[0] == 0xa0)
     {
@@ -895,109 +834,6 @@ scan_ssm_run_state (FpiSsm *ssm, FpDevice *dev)
 }
 
 /* ================================================================== */
-/* Image matching (NCC-based, rotation-normalised)                     */
-/* ================================================================== */
-
-#define NCC_SEARCH  12    /* translation search radius in pixels */
-#define NCC_THRESH  0.48  /* accept threshold (tunable via FP_NCC_THRESH) */
-
-/* Dominant gradient angle — Rao structure tensor method */
-static double
-dominant_angle (const guint8 *buf, int w, int h)
-{
-  double gxx = 0, gyy = 0, gxy = 0;
-  for (int y = 1; y < h - 1; y++)
-    for (int x = 1; x < w - 1; x++)
-      {
-        double gx = (buf[y * w + x + 1] - buf[y * w + x - 1]) * 0.5;
-        double gy = (buf[(y + 1) * w + x] - buf[(y - 1) * w + x]) * 0.5;
-        gxx += gx * gx;  gyy += gy * gy;  gxy += gx * gy;
-      }
-  return 0.5 * atan2 (2.0 * gxy, gxx - gyy);
-}
-
-/* Rotate src CCW by angle into dst; fill OOB with image mean */
-static void
-rotate_img (const guint8 *src, guint8 *dst, int w, int h, double angle)
-{
-  double sum = 0;
-  for (int i = 0; i < w * h; i++) sum += src[i];
-  guint8 fill = (guint8) (sum / (w * h));
-
-  double cx = (w - 1) * 0.5, cy = (h - 1) * 0.5;
-  double ca = cos (-angle), sa = sin (-angle);
-
-  for (int dy = 0; dy < h; dy++)
-    for (int dx = 0; dx < w; dx++)
-      {
-        double rx = dx - cx, ry = dy - cy;
-        double sx = ca * rx - sa * ry + cx;
-        double sy = sa * rx + ca * ry + cy;
-        int x0 = (int) sx, y0 = (int) sy;
-        double fx = sx - x0, fy = sy - y0;
-        int x1 = x0 + 1, y1 = y0 + 1;
-        if (x0 < 0 || y0 < 0 || x1 >= w || y1 >= h)
-          dst[dy * w + dx] = fill;
-        else
-          dst[dy * w + dx] = (guint8) (
-            src[y0 * w + x0] * (1 - fx) * (1 - fy) +
-            src[y0 * w + x1] * fx       * (1 - fy) +
-            src[y1 * w + x0] * (1 - fx) * fy       +
-            src[y1 * w + x1] * fx       * fy        + 0.5);
-      }
-}
-
-/* Preprocess image in self->image_buf → dst:
- * rotate to canonical orientation. (FPN+stretch already done in SCAN_SUBMIT) */
-static void
-preprocess (FpiDeviceFt9201 *self, guint8 *dst)
-{
-  int w = self->sensor_width, h = self->sensor_height;
-  double angle = dominant_angle (self->image_buf, w, h);
-  rotate_img (self->image_buf, dst, w, h, angle);
-}
-
-/* NCC of a vs b shifted by (tx,ty) over their overlap */
-static double
-ncc_shifted (const guint8 *a, const guint8 *b, int w, int h, int tx, int ty)
-{
-  int x0 = MAX (0, -tx), x1 = MIN (w, w - tx);
-  int y0 = MAX (0, -ty), y1 = MIN (h, h - ty);
-  if (x1 <= x0 || y1 <= y0) return -1.0;
-
-  double sa = 0, sb = 0, n = (double) (x1 - x0) * (y1 - y0);
-  for (int y = y0; y < y1; y++)
-    for (int x = x0; x < x1; x++)
-      { sa += a[y * w + x]; sb += b[(y + ty) * w + (x + tx)]; }
-  double ma = sa / n, mb = sb / n;
-
-  double num = 0, da2 = 0, db2 = 0;
-  for (int y = y0; y < y1; y++)
-    for (int x = x0; x < x1; x++)
-      {
-        double da = a[y * w + x] - ma;
-        double db = b[(y + ty) * w + (x + tx)] - mb;
-        num += da * db;  da2 += da * da;  db2 += db * db;
-      }
-  double denom = sqrt (da2 * db2);
-  return denom < 1e-9 ? 0.0 : num / denom;
-}
-
-/* Best NCC over ±NCC_SEARCH translation */
-static double
-img_match (const guint8 *a, const guint8 *b, int w, int h)
-{
-  double best = -1.0;
-  for (int ty = -NCC_SEARCH; ty <= NCC_SEARCH; ty++)
-    for (int tx = -NCC_SEARCH; tx <= NCC_SEARCH; tx++)
-      {
-        double s = ncc_shifted (a, b, w, h, tx, ty);
-        if (s > best) best = s;
-      }
-  return best;
-}
-
-/* ================================================================== */
 /* Scan SSM completion → enroll / verify dispatch                      */
 /* ================================================================== */
 
@@ -1150,7 +986,6 @@ dev_open (FpDevice *dev)
 
   self->fw_offset  = 0;
   self->fw_retries = 0;
-  self->diag_idx   = 0;
 
   ssm = fpi_ssm_new (dev, init_ssm_run_state, INIT_NUM_STATES);
   fpi_ssm_start (ssm, init_ssm_complete);

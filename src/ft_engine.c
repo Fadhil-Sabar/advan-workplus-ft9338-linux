@@ -5,7 +5,9 @@
 // Build: gcc -O0 -g -o loader loader.c
 // x86-64 Linux: glibc TLS uses %fs, so %gs is free for the Windows TEB.
 
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -128,7 +130,11 @@ static u32  MS sh_GetOEMCP(void){ return 437; }
 static int  MS sh_GetCPInfo(u32 cp,void*info){ if(info){ u8*p=info; *(u32*)p=1; p[4]=0; p[5]=0; } return 1; }
 static int  MS sh_IsValidCodePage(u32 cp){ return 1; }
 static int  MS sh_MultiByteToWideChar(u32 cp,u32 f,const char*mb,int mbc,u16*wc,int wcc){
-  if(mbc<0) mbc=strlen(mb)+1; if(wcc==0) return mbc; int n=mbc<wcc?mbc:wcc; for(int i=0;i<n;i++) wc[i]=(u8)mb[i]; return n; }
+  if(mbc<0) mbc=strlen(mb)+1;
+  if(wcc==0) return mbc;
+  int n=mbc<wcc?mbc:wcc;
+  for(int i=0;i<n;i++) wc[i]=(u8)mb[i];
+  return n; }
 static int  MS sh_WideCharToMultiByte(u32 cp,u32 f,const u16*wc,int wcc,char*mb,int mbc,void*d,void*u){
   if(wcc<0){ wcc=0; while(wc[wcc]) wcc++; wcc++; } if(mbc==0) return wcc; int n=wcc<mbc?wcc:mbc; for(int i=0;i<n;i++) mb[i]=(char)wc[i]; return n; }
 static int  MS sh_LCMapStringW(u32 l,u32 f,const u16*s,int sc,u16*d,int dc){ if(dc==0) return sc; int n=sc<dc?sc:dc; for(int i=0;i<n;i++) d[i]=s[i]; return n; }
@@ -312,7 +318,6 @@ static int load_pe(void){
 static void* get_export(const char*want){
   u32 e=f32(0x3c);
   u32 exprva=f32(e+24+112+8*0);
-  u32 nfns=*(u32*)(g_image+exprva+20);
   u32 nnames=*(u32*)(g_image+exprva+24);
   u32 fns=*(u32*)(g_image+exprva+28);
   u32 names=*(u32*)(g_image+exprva+32);
@@ -332,14 +337,6 @@ static void* get_export(const char*want){
 static u8 pipeline[1024];
 static u8 birbuf[262144];
 
-static int load_pgm(const char*path,u8**pix,int*w,int*h){
-  FILE*f=fopen(path,"rb"); if(!f)return -1; fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
-  u8*b=malloc(n); fread(b,1,n,f); fclose(f);
-  int i=0; char tok[32]; int ti;
-  #define TOK() do{ while(b[i]==' '||b[i]=='\n'||b[i]=='\t'||b[i]=='\r')i++; ti=0; while(b[i]!=' '&&b[i]!='\n'&&b[i]!='\t'&&b[i]!='\r')tok[ti++]=b[i++]; tok[ti]=0; }while(0)
-  TOK(); TOK(); *w=atoi(tok); TOK(); *h=atoi(tok); TOK(); i++;
-  *pix=b+i; return 0;
-}
 static u8 small[262144];
 static void resize(u8*src,int sw,int sh,int dw,int dh){ for(int y=0;y<dh;y++)for(int x=0;x<dw;x++) small[y*dw+x]=src[(y*sh/dh)*sw+(x*sw/dw)]; }
 // Prepare an ENG_W x ENG_H frame in `small`. If the source is at least as large,
