@@ -118,6 +118,15 @@ Then re-run `scripts/build.sh`.
   blob via [mrrbrilliant/ft9201-static](https://github.com/mrrbrilliant/ft9201-static).
 - Built on [libfprint](https://gitlab.freedesktop.org/libfprint/libfprint).
 
+## Related projects
+
+- [championswimmer/libfprint-eh577](https://github.com/championswimmer/libfprint-eh577)
+  — a Linux driver effort for the **EgisTec EH577** (`1c7a:0577`), another
+  press-type "Windows Hello only" reader (52×72 active sensor). Different vendor
+  and USB protocol, but the same *match-on-host* shape: its Windows package ships
+  a vendor engine adapter DLL (`EgisTouchFPEngine0577.dll`, no VBS enclave), so
+  the method in **[PORTING.md](PORTING.md)** applies to it too.
+
 ## License
 
 The driver and loader (`src/`, `scripts/`) are **LGPL-2.1-or-later**, matching
