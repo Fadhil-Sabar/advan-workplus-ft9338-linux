@@ -21,8 +21,12 @@ Working end-to-end on real hardware: enroll and verify through `fprintd` /
 command-line tools, and in KDE/GNOME once installed. It matches your finger
 using the vendor's real algorithm.
 
+Developed and tested against
+[this exact reader](https://www.amazon.com/dp/B0DK7LQZGH) (ASIN `B0DK7LQZGH`) —
+the FT9348W variant of `2808:93a9`.
+
 Caveats:
-- Tested only on the FT9348W variant of the `2808:93a9` device.
+- Tested only on that FT9348W variant of the `2808:93a9` device.
 - The matcher is a proprietary blob we call into; we can't fix bugs inside it.
 - x86-64 only (the DLL and loader are 64-bit).
 
