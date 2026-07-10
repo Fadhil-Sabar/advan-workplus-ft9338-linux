@@ -4,6 +4,10 @@ Linux fingerprint support for the **Focal-systems FT9201** USB reader
 (`2808:93a9`, sold as a standalone Windows Hello dongle), as a
 [libfprint](https://gitlab.freedesktop.org/libfprint/libfprint) driver.
 
+<p align="center">
+  <img src="docs/sensor.jpg" alt="Focal-systems FT9201 USB fingerprint reader" width="360">
+</p>
+
 The sensor is a tiny 96×96 optical reader. libfprint's built-in matcher does a
 poor job on an image that small, so this driver instead reuses **FocalTech's own
 matching engine** — the `ftWbioEngineAdapter.dll` from their signed Windows
