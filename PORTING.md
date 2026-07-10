@@ -177,8 +177,14 @@ so the distro's libfprint is untouched. See `scripts/` and the main README.
   reimplement it — that's the vendor's tuned IP.
 - **Firmware: upload *and start* it.** Missing the post-upload config writes left
   the MCU dead with the firmware loaded but not running.
-- **Geometry: crop to the engine's size, don't squish.** Uneven scaling destroys
-  match reliability.
+- **Feed the engine the size it's *tuned* for, not the sensor's native size.**
+  The engine's alg config carries the dimensions it was designed around. Ours
+  wants 64×80 even though the sensor is 96×96 — and while the DLL will *accept*
+  the larger image (feature extraction succeeds), *matching* collapses (genuine
+  fingers stop matching). Bigger is not better; reduce to the configured size.
+- **Reduce by cropping, not uneven scaling.** Non-uniform scaling (e.g. 96→64
+  wide, 96→80 tall) distorts ridge spacing and wrecks match reliability; a
+  center-crop preserves geometry.
 - **Engine state is global and `%gs`-based.** Load it once, re-arm `%gs` per call,
   and don't clear it on device close — or `fprintd` will segfault on the second
   operation.

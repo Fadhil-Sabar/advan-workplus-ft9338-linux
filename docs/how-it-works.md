@@ -67,6 +67,16 @@ The engine expects a 64×80 image. The sensor delivers 96×96, so each frame is
 vertically distorts ridge spacing unevenly and hurts matching). The crop keeps
 the central fingerprint region at native resolution.
 
+Why 64×80 and not the sensor's full 96×96? It's not an arbitrary choice or an
+artifact of the DLL we happened to grab — it's the size the matcher is *tuned*
+for on this chip (`chip_type 3` → `width 64, height 80` in the engine's own alg
+config), and it's the size the Windows sensor adapter feeds it. We measured this
+directly: the DLL will happily *accept* 96×96 (feature extraction succeeds, up to
+~128×128; 192×192 crashes it), but **matching then fails** — the genuine finger
+stops matching its own enrollment (0/5 fingers matched at 96×96 vs 5/5 at 64×80).
+Bigger input is not better here; feeding the engine the size it was designed for
+is what makes matching work.
+
 ## Firmware and DLL provenance
 
 Both proprietary pieces come from existing public sources and are fetched, not
