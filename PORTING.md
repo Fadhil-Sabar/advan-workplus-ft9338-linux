@@ -72,6 +72,14 @@ Good signs (this repo's DLL had all of them):
 
 ## 3. Load the DLL in-process (reusable)
 
+A **PE loader** does by hand what the Windows loader normally does when you launch
+an `.exe` or load a `.dll`: it parses the file's **PE** (Portable Executable)
+structure, copies its sections into memory at the right addresses, fills in the
+functions it imports from other libraries, and jumps to its entry point — so a
+Windows binary can run even though the OS underneath isn't Windows. A general PE
+loader is a big job; here we only need to load one well-behaved DLL, so it stays
+small.
+
 `src/ft_engine.c` in this repo is a ~450-line loader that runs a `kernel32`-only
 PE in-process on Linux. It is largely reader-agnostic — the reusable core is:
 
@@ -82,6 +90,19 @@ PE in-process on Linux. It is largely reader-agnostic — the reusable core is:
   for thread-local state on x64; glibc uses `%fs`, so `%gs` is free);
 - run the DLL's `DllMain` to initialise its static CRT;
 - provide the shims the CRT actually calls.
+
+**What the TEB / `%gs` step means.** On 64-bit Windows every thread has a *Thread
+Environment Block* — a per-thread struct holding its stack bounds, thread-local
+storage (TLS) pointer, PEB pointer, last-error value, and so on. Windows code
+reads it through the `%gs` segment register (e.g. `gs:[0x58]` is "my TLS
+pointer"), and the C runtime does this constantly. Linux has no TEB and uses the
+*other* segment register, `%fs`, for its own thread-local storage — which leaves
+`%gs` free. So the loader allocates a small block of memory, fills in just the
+handful of fields the DLL actually reads, and points `%gs` at it with
+`arch_prctl(ARCH_SET_GS, …)`. It's a hand-built stub, not the real ~1800-byte OS
+structure, but enough that the DLL can't tell the difference for the parts it
+touches. Because `%gs` is per-thread, you must re-arm it on every entry into the
+engine (see the next point).
 
 Two properties worth keeping:
 - **W^X-safe loading.** Prepare the resolved image in a buffer, write it to an
