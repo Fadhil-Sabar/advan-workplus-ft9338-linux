@@ -28,8 +28,28 @@ Quick tells you have a match-on-host reader:
   a DLL that exports `WbioQueryEngineInterface`.
 - The sensor is a cheap optical/capacitive module with no security silicon.
 
-If libfprint's built-in NBIS matcher does a bad job (common on small sensors),
-reusing the vendor engine is usually the only way to get good matching.
+### Why the vendor engine, and not generic matching?
+
+libfprint's default path (`FpImageDevice`) matches with **NBIS / bozorth3** —
+*minutiae* matching. It extracts the little ridge features (endings,
+bifurcations) into a point map and scores two prints by how well those maps
+align. It's the industry-standard method, but it assumes a reasonably large,
+detailed image. On a **tiny sensor** (this project's was 96×96) there simply
+aren't enough clean minutiae to extract reliably, so matching becomes flaky —
+that's the usual reason a small-sensor reader "doesn't really work" under
+libfprint.
+
+Rolling your own matcher is tempting but rarely pays off. A pixel-correlation
+approach — e.g. averaging several frames into a template and comparing with
+**NCC** (normalized cross-correlation) — sidesteps minutiae, but it's brittle to
+finger placement, rotation, and pressure. We tried both NBIS *and* a homegrown
+NCC matcher first; neither held up.
+
+The underlying reason: a match-on-host reader was never meant to be matched by a
+generic algorithm. The vendor ships a matcher **tuned for that specific little
+sensor** and runs it in their DLL. So when the built-in and DIY routes fail,
+reusing the vendor's engine is usually the only thing that gives reliable
+matching — which is what the rest of this guide is about.
 
 ---
 
