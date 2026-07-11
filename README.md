@@ -122,6 +122,37 @@ Then re-run `scripts/build.sh`.
   blob via [mrrbrilliant/ft9201-static](https://github.com/mrrbrilliant/ft9201-static).
 - Built on [libfprint](https://gitlab.freedesktop.org/libfprint/libfprint).
 
+## Other ways to run an FT9201 on Linux
+
+This isn't the only approach — the alternatives differ mainly in *how* they reuse
+FocalTech's matcher (they all do; the tiny sensor rules out generic matching).
+
+- **[Romk-a/ft9201-linux-setup](https://github.com/Romk-a/ft9201-linux-setup)** — a
+  Debian/Ubuntu (Astra Linux) guide that installs FocalTech's **prebuilt
+  proprietary Linux "TOD" driver** (from
+  [ryenyuku/libfprint-ft9201](https://github.com/ryenyuku/libfprint-ft9201); Fedora
+  RPMs have existed too) and binary-patches its USB-ID table (`9338` → `93a9`).
+  - **How it compares:** that route is *less work* — install a `.deb`, patch two
+    bytes, no reverse-engineering. But it needs **TOD-enabled libfprint**
+    (Debian/Ubuntu-family; **not** on stock Fedora/Arch), it **replaces your entire
+    system `libfprint`** with an old, fully-closed build, and you have to fight the
+    package manager to keep it pinned. This project instead ships an **open** driver,
+    installs **side-by-side** (your distro's libfprint is untouched), runs on
+    **mainline libfprint with no TOD**, and loads only the isolated vendor *matcher*
+    DLL — which is what all the reverse-engineering bought.
+  - **Short version:** on Debian/Ubuntu, the TOD route is the easy button; on
+    Fedora/Arch, or if you want it open and non-invasive, use this.
+- **Kernel drivers** exist ([banianitc](https://github.com/banianitc/ft9201-fingerprint-driver)
+  — the protocol reference this project reverse-engineered from,
+  [bm16ton/ft92010x9338](https://github.com/bm16ton/ft92010x9338)) but they don't
+  integrate with libfprint/fprintd, so there's no login/PAM support.
+
+The proprietary Linux TOD driver those `.deb`/RPM packages redistribute appears to
+have been a FocalTech/GPD release for the GPD Win 4 that was later **pulled from
+official distribution** — which is why it now survives only as community re-hosts.
+(Note also that some GPD Win 4 units ship a different sensor entirely, a Chipsailing
+CS9711, not this FocalTech part.)
+
 ## Related projects
 
 - [championswimmer/libfprint-eh577](https://github.com/championswimmer/libfprint-eh577)
