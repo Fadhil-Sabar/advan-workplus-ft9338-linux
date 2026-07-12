@@ -52,7 +52,7 @@ static int set_gs(void *base){ return syscall(SYS_arch_prctl, ARCH_SET_GS, base)
 // ---------- import shim table ----------
 typedef struct { const char *name; void *fn; } Shim;
 static Shim shims[128]; static int nshims;
-static void reg(const char*n, void*f){ shims[nshims].name=n; shims[nshims].fn=f; nshims++; }
+static void reg(const char*n, void*f){ if(nshims>=(int)(sizeof shims/sizeof*shims)){fprintf(stderr,"ft_engine: shim table full (%d) — raise shims[]\n",nshims);abort();} shims[nshims].name=n; shims[nshims].fn=f; nshims++; }
 static void* find_shim(const char*n){ for(int i=0;i<nshims;i++) if(!strcmp(shims[i].name,n)) return shims[i].fn; return 0; }
 
 // ================= SHIMS (all MS ABI) =================

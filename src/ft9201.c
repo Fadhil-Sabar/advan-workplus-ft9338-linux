@@ -690,8 +690,16 @@ scan_image_cb (FpiUsbTransfer *t, FpDevice *dev, gpointer ud, GError *err)
       memcpy (self->image_buf, t->buffer + 2, img_bytes);
     }
   else
-    fp_warn ("ft9201: short read: %zd < %zu",
-             (ssize_t) t->actual_length, img_bytes + 2);
+    {
+      fp_warn ("ft9201: short read: %zd < %zu",
+               (ssize_t) t->actual_length, img_bytes + 2);
+      /* Invalidate the previous frame's quality bytes. Otherwise SCAN_SUBMIT
+         reads them as ok and feeds the stale frame to the engine (a stale
+         frame could match during verify). Both-zero = bad scan, so this takes
+         the bad-scan path instead. */
+      self->image_buf[img_bytes]     = 0;
+      self->image_buf[img_bytes + 1] = 0;
+    }
 
   fpi_ssm_next_state (t->ssm);
 }
