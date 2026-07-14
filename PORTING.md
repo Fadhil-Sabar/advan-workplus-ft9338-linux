@@ -81,12 +81,16 @@ objdump -x EngineAdapter.dll | grep -i wbio         # exports WbioQueryEngineInt
 strings EngineAdapter.dll | grep -i enclave         # VBS enclave?
 ```
 
-Good signs (this repo's DLL had all of them):
-- Imports **only `kernel32`** (plus maybe a couple of well-known DLLs).
+Good signs:
 - Exports `WbioQueryEngineInterface`.
 - **No VBS enclave** — if it imports `CreateEnclave`/`CallEnclave` or loads a
   separate enclave module, the real matcher runs in a secure enclave you can't
-  host, and this approach won't work.
+  host, and this approach won't work. This is the one true dealbreaker.
+
+The import list tells you which path you're on. **`kernel32`-only** (like this
+repo's DLL) is the easy no-crypto case. If it also imports **`bcrypt`** (usually
+alongside `advapi32`/`setupapi`), the engine runs an SDCP secure channel — still
+workable, but you take the crypto path in **§3b** with `src/crypto_shims.c`.
 
 ---
 
@@ -140,6 +144,65 @@ device geometry and, if your DLL imports functions ours didn't, a few more shims
 
 ---
 
+## 3b. If your engine ships crypto (an SDCP secure channel)
+
+Some Windows Hello engines don't just import `kernel32` — they run Microsoft's
+**Secure Device Connection Protocol (SDCP)**: at `Attach` they ECDH-handshake with
+the sensor firmware, verify a device certificate chain against a Microsoft root,
+and **encrypt each sample** between sensor and engine. Synaptics, Goodix, ELAN,
+and EgisTec parts do this. A no-crypto engine like the FT9201's is the lucky
+minority — so this repo also carries the crypto path, in **`src/crypto_shims.c`**
+(an optional module, not built for the FT9201).
+
+**The framing that makes it tractable: you own the process.** SDCP's crypto gates
+exist to stop an *external* attacker tampering with the host engine. When your
+loader *is* the host, every gate is neutralizable in-process. A crypto sensor
+differs from a no-crypto one only by (a) a bcrypt-shim group and (b) an `Attach`
+handshake that expects device I/O — both defeatable without a real device, **or**
+replaceable with a real handshake against genuine silicon if you want attestation
+to be true rather than bypassed.
+
+**When the offline bypass is valid — verify by disassembly first.** It works only
+if the engine is **match-on-host** and its extractor consumes a **plaintext** image
+with no per-sample MAC/signature gating extraction. Trace the sample buffer out of
+`AcceptSampleData`: if it flows through a `BCryptDecrypt` then straight into feature
+extraction, a substituted plaintext sample is not cryptographically rejected and
+the bypass is sound. If the extractor consumes session-key material *as data* (not
+just as a checkable gate), the bypass fails and you must do the real handshake.
+
+**The two hooks that carry the load** (in `crypto_shims.c`):
+- `BCryptDecrypt` → **passthrough** — defeats the per-sample seal; the extractor
+  gets the plaintext image.
+- `BCryptVerifySignature` → **success** — defeats the `Attach`-time device
+  cert-chain verify against the Microsoft root.
+
+The remaining bcrypt shims just return success with **deterministic**, well-formed
+outputs so the engine's init state machine proceeds — determinism matters so enroll
+and verify see the same derived key material.
+
+**Getting `Attach` to build a context with no device** (observed on one crypto
+vendor; a template, not gospel):
+- `pipeline[0]` must be a **nonzero device handle** — seed any nonzero value.
+- `Attach` drives `DeviceIoControl` expecting **well-formed shapes**, not valid
+  content (the verify is hooked). Seen: a cert read (~1580B), a nonce (~512B), a
+  challenge (208/208). Return buffers of the requested length; content is irrelevant.
+- The cert "parser" may not be crypto — one vendor's `StrStrIW`-searched the blob
+  for the sensor **model string**. Embed the expected model string (UTF-16) in the
+  cert-shaped buffer and the parser builds a valid descriptor. Check your engine's
+  strings for the model tokens it looks for.
+- If a real-silicon challenge-response gate remains and you've proven the session
+  is unused by the matcher, force `Attach`'s success branch with a couple of 2-byte
+  patches to the scratch image before it's mapped (preferred base, RVA == file
+  offset, no relocation).
+
+To wire it up: `#include "crypto_shims.c"` inside `ft_engine.c`, call
+`register_crypto_shims()` from `register_shims()`, and bump `shims[128]` to `256`
+(crypto sensors also pull in ~18 more `kernel32` plus `advapi32`/`setupapi`/etc.
+imports). If you instead have the physical sensor and want real attestation, do the
+genuine ECDH + cert verify + challenge-response rather than these bypasses.
+
+---
+
 ## 4. Recover the WinBio engine ABI
 
 The engine exposes a **`WINBIO_ENGINE_INTERFACE`** (documented in Microsoft's
@@ -161,6 +224,17 @@ recovered; yours will differ but the *shape* is the same. Tip: if the vendor als
 ships a **Linux** blob (some do, as a "TOD" `.so`), it is usually unstripped and
 disassembles far more cleanly than the Windows WDF driver — it was our Rosetta
 Stone for both the ABI and the hardware init.
+
+**Two facts that de-risk the next port** — both confirmed *identical* across two
+unrelated vendors, so they are WINBIO-standard, not vendor-specific:
+- The engine vtable slots at `iface+32+N*8` — **Attach=0, AcceptSampleData=8,
+  VerifyFeatureSet=10, CreateEnrollment=12, UpdateEnrollment=13,
+  GetEnrollmentStatus=14, CommitEnrollment=17** — and the storage-adapter slots held
+  the same on both. Start from these; don't rediscover them from scratch.
+- `build_bir` in this repo emits a **single** format pair, which lenient engines
+  (FocalTech) accept. Stricter engines want the **full** WINBIO_BIR envelope: two
+  format pairs (`hdr+0x28/0x2a` **and** `hdr+0x2c/0x2e`) plus a version-block offset
+  at `+0x14`, or you get `E_INVALIDARG`. Emit the full envelope and it works on both.
 
 ---
 
@@ -231,6 +305,20 @@ so the distro's libfprint is untouched. See `scripts/` and the main README.
   operation.
 - **Run W^X-safe** (file-backed executable pages) so you never have to disable
   `MemoryDenyWriteExecute` on `fprintd`.
+- **Heap shims must survive a double-free — but don't "fix" it by leaking.** Routing
+  `HeapFree`→`free` and `HeapReAlloc`→`realloc` (what the FT9201 loader here does) is
+  correct and flat: FocalTech's CRT never double-frees. But some crypto engines' static
+  CRTs realloc-then-free the same block, which aborts glibc. The tempting fix — a
+  **leak-only** allocator (`HeapFree` = no-op) — works, but we *measured it leaking
+  ~2.7 MB per verify*, which OOMs any daemon fast. Use a **tracked-idempotent**
+  allocator instead: free for real (flat memory) but ignore double or foreign frees.
+  Apply it to `Heap*` **and** `Local*`. (FT9201 needs none of this — real free is
+  correct for it; this is only for a double-freeing crypto CRT.)
+- **Drain large frame reads fully.** If a frame's length is encoded in the read
+  command, read until the short packet. A fixed/short read leaves multi-KB residue in
+  the pipe that wedges the *next* command — which looks exactly like a false "read
+  budget" and invites needless retry/recycle logic. If a capture loop recycles on
+  timeout, check it isn't papering over an undrained response.
 - **Redistribution.** You cannot ship the vendor DLL or firmware. Fetch/extract
   them from existing public sources at build time.
 
@@ -240,6 +328,8 @@ so the distro's libfprint is untouched. See `scripts/` and the main README.
 
 - `src/ft_engine.c` — the in-process, W^X-safe PE loader + `kernel32` shims +
   WinBio bridge + storage stub. The bulk of it is not FT9201-specific.
+- `src/crypto_shims.c` — optional module extending the loader to **SDCP-crypto**
+  sensors (the bcrypt-shim group + the own-the-process bypass). See §3b.
 - `scripts/` — the fetch/extract/build/install pattern (out-of-tree driver on
   pinned libfprint, side-by-side install, no hardening disabled).
 

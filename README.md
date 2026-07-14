@@ -14,10 +14,14 @@ matching engine** — the `ftWbioEngineAdapter.dll` from their signed Windows
 driver — running it natively on Linux with a small in-process PE loader. No Wine,
 no Windows, no cloud.
 
-> **Have a different "Windows Hello only" reader?** The technique here — running a
-> vendor's Windows matching engine natively on Linux — generalizes. See
-> **[PORTING.md](PORTING.md)** for a step-by-step method and which parts of this
-> repo you can reuse as-is.
+> **This repo is also a reusable method, not just one driver.** The technique —
+> running a vendor's Windows matching engine natively on Linux, no Wine —
+> generalizes to other "Windows Hello only" readers, **including ones that ship an
+> SDCP secure channel** (the Synaptics/Goodix/ELAN/EgisTec-class crypto sensors),
+> via the optional [`src/crypto_shims.c`](src/crypto_shims.c) module. The FT9201 is
+> the worked example; the in-process loader, the WinBio bridge, and the
+> crypto-bypass layer carry over to the next device. See **[PORTING.md](PORTING.md)**
+> for the step-by-step method and what to reuse as-is.
 
 ## Status
 
