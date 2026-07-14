@@ -335,3 +335,40 @@ so the distro's libfprint is untouched. See `scripts/` and the main README.
 
 The FT9201-specific work lives in `src/ft9201.c` (USB + capture) and the exact
 ABI offsets. Swap those for your device and the rest largely carries over.
+
+---
+
+## Resources & prior art (for the crypto path)
+
+External tooling the no-crypto FT9201 route never needed, and starting points for
+the next SDCP-crypto sensor:
+
+- **Keystone: [`uunicorn/synaWudfBioUsb-sandbox`](https://github.com/uunicorn/synaWudfBioUsb-sandbox)**
+  and its Wine fork [`uunicorn/wine`](https://github.com/uunicorn/wine) (the
+  validity-sensor hacking branch). It loads a vendor UMDF2 biometric driver under a
+  patched Wine and traces it with `WINEDEBUG` — how you lift the vendor command
+  protocol with no Windows box. Originally for Synaptics/Validity sensors but
+  vendor-agnostic enough to host other UMDF drivers with adaptation. libfprint
+  maintainer **Marco Trevisan (3v1n0)** forked it and pointed us here.
+- **usbmon** (`/sys/kernel/debug/usb/usbmon/`) for passive wire ground-truth —
+  cross-check the harness traces, and trust it over language-binding reads on IN
+  transfers (a bindings bug returned zeros).
+- **WBF / WBDI ABI** — `WbioQueryEngineInterface` → the `WINBIO_ENGINE_INTERFACE`
+  vtable (the matcher API §4 drives) and `WINBIO_BIR` (the sample envelope). Plus
+  **UMDF2/WDF** background, **WDK headers** via NuGet
+  (`microsoft.windows.sdk.cpp`, `microsoft.windows.wdk.x64`), and **CNG/BCrypt** —
+  the crypto surface §3b shims.
+- **SDCP** (Microsoft's Secure Device Connection Protocol) + **Microsoft Root CA
+  2010** — the attestation model and the root the device cert chains to (what the
+  `BCryptVerifySignature` hook skips).
+- **RE tooling:** `capstone` + `pefile` (pip) — locate functions by string xref,
+  trace decrypt→extract, prove no per-sample MAC gates extraction. Targeted enough
+  that Ghidra isn't needed; `objdump`/`nm` for quick import/export views.
+- **Prior art:**
+  [`championswimmer/libfprint-eh577`](https://github.com/championswimmer/libfprint-eh577)
+  — read it for the device protocol, not its recovery logic (its "read budget" was
+  the undrained-frame misread; see the Gotcha above).
+- **Why the vendor-matcher route exists at all:** 3v1n0's push to improve
+  libfprint's *own* matching upstream is the flip side — generic minutiae matching
+  hits a false-accept wall on tiny sensors, which is what drove both drivers to the
+  vendor engine.
