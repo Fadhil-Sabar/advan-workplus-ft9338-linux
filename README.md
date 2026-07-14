@@ -126,6 +126,20 @@ Then re-run `scripts/build.sh`.
   blob via [mrrbrilliant/ft9201-static](https://github.com/mrrbrilliant/ft9201-static).
 - Built on [libfprint](https://gitlab.freedesktop.org/libfprint/libfprint).
 
+The reusable method and crypto-sensor path additionally build on the work of:
+
+- **[uunicorn](https://github.com/uunicorn)** — whose
+  [synaWudfBioUsb-sandbox](https://github.com/uunicorn/synaWudfBioUsb-sandbox) and
+  [wine fork](https://github.com/uunicorn/wine) are the harness for tracing a
+  vendor's Windows biometric driver under Wine, which is how a crypto sensor's
+  command protocol gets recovered without a Windows box.
+- **Marco Trevisan ([3v1n0](https://github.com/3v1n0))**, a libfprint maintainer —
+  who pointed the way to that Wine-tracing approach, and whose push to improve
+  libfprint's own matching upstream frames why the vendor-matcher route exists at
+  all.
+- **[championswimmer/libfprint-eh577](https://github.com/championswimmer/libfprint-eh577)**
+  — prior art for the EgisTec EH577 sensor family.
+
 ## Other ways to run an FT9201 on Linux
 
 This isn't the only approach — the alternatives differ mainly in *how* they reuse
