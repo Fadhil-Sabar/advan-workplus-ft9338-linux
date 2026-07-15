@@ -179,6 +179,11 @@ CS9711, not this FocalTech part.)
   and USB protocol, but the same *match-on-host* shape: its Windows package ships
   a vendor engine adapter DLL (`EgisTouchFPEngine0577.dll`, no VBS enclave), so
   the method in **[PORTING.md](PORTING.md)** applies to it too.
+- **[OMGrant/eh577-libfprint](https://github.com/OMGrant/eh577-libfprint)** — this
+  method carried end-to-end to the **EgisTec EH577** and published as a working
+  driver. The §3b crypto techniques were validated against its SDCP builds; the
+  distributed driver targets a *pre-SDCP* Catalog build (a pure-software matcher —
+  see §3b's note on build selection), enrolling and verifying real fingers on Linux.
 
 ## License
 

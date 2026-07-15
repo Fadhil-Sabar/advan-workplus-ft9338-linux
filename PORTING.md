@@ -51,6 +51,14 @@ sensor** and runs it in their DLL. So when the built-in and DIY routes fail,
 reusing the vendor's engine is usually the only thing that gives reliable
 matching — which is what the rest of this guide is about.
 
+This isn't unique to one sensor. The same wall was hit independently on a second,
+even smaller reader (70×57): NBIS/minutiae, a phase-only-correlation matcher, **and**
+libfprint's own SIFT-keypoint matcher for small sensors (SIGFM) all landed at or
+near chance on cross-session prints, while the vendor's tuned engine matched cleanly.
+Below a certain sensor size, no generic open matcher — minutiae, correlation, or
+keypoint — reliably discriminates; the vendor's sensor-specific algorithm is what
+clears it.
+
 ---
 
 ## 1. Get the Windows driver
@@ -133,7 +141,12 @@ Two properties worth keeping:
   anonymous file (`memfd`), then map each section from that file: code
   read-execute, data read-write, never both. File-backed executable mappings are
   allowed under `MemoryDenyWriteExecute`, so the engine runs inside `fprintd`
-  without weakening its systemd hardening.
+  without weakening its systemd hardening. The same file-backed mapping also matters
+  for **SELinux**: on a strict distro (Fedora/RHEL), loading the DLL into *anonymous*
+  executable memory can trip an `execmem` denial, whereas file-backed pages (`r-xp`,
+  not anonymous exec) satisfy the policy. A second sensor's driver hit exactly this
+  SELinux wall loading its DLL on Fedora — being file-backed from the start is what
+  keeps you clear of it.
 - **Re-arm `%gs` on every entry**, and treat the engine as **process-global,
   loaded once** — never tear it down on device close. (`fprintd` re-opens the
   device between operations, sometimes on another thread; both facts bit us as
@@ -200,6 +213,20 @@ To wire it up: `#include "crypto_shims.c"` inside `ft_engine.c`, call
 (crypto sensors also pull in ~18 more `kernel32` plus `advapi32`/`setupapi`/etc.
 imports). If you instead have the physical sensor and want real attestation, do the
 genuine ECDH + cert verify + challenge-response rather than these bypasses.
+
+**Before you shim any of this: check for an older Catalog build.** Vendors ship
+multiple driver packages to the Update Catalog over time, and an **earlier** build
+may predate the SDCP/enclave hardening — a **pure-software matcher** with no secure
+channel, no `Attach` handshake, nothing to bypass — while a later build for the same
+hardware ID adds the crypto. If a pre-SDCP build exists, targeting it (pinned by
+update ID + checksum) sidesteps this entire section: you're back in the no-crypto
+FT9201 case, and you never circumvent a protection measure. The EgisTec EH577 had
+exactly this split — a 2019 pure-software build alongside later SDCP ones. Grep the
+Catalog builds' strings for enclave/SGX and pick the clean one if you can.
+
+A full worked example of this crypto path — loader, bcrypt-shim group, and the
+build-selection trick — is
+[OMGrant/eh577-libfprint](https://github.com/OMGrant/eh577-libfprint).
 
 ---
 
@@ -319,6 +346,14 @@ so the distro's libfprint is untouched. See `scripts/` and the main README.
   the pipe that wedges the *next* command — which looks exactly like a false "read
   budget" and invites needless retry/recycle logic. If a capture loop recycles on
   timeout, check it isn't papering over an undrained response.
+- **Size WBF adapter vtable stubs generously and fill every slot.** The engine may
+  dispatch a storage/sensor-adapter method at an offset *past* the slots you
+  identified — one vendor's verify path called a slot one entry beyond a 0x100-sized
+  table. A standalone harness can survive the past-end read by memory-layout luck;
+  inside `fprintd` it hit garbage and SIGSEGV'd — a classic works-in-the-test-harness,
+  crashes-in-the-daemon heisenbug. Size the storage/sensor vtables generously (e.g.
+  `0x200`) and fill all slots with the no-op default; don't size to just the known
+  offsets.
 - **Redistribution.** You cannot ship the vendor DLL or firmware. Fetch/extract
   them from existing public sources at build time.
 
