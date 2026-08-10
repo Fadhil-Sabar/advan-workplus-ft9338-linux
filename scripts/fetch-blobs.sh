@@ -4,7 +4,7 @@
 #
 #   1. ftWbioEngineAdapter.dll  — the matcher, from FocalTech's signed Windows
 #      driver on the Microsoft Update Catalog.
-#   2. FT9348W MCU firmware     — extracted from the public ft9201-static blob.
+#   2. FT9338W MCU firmware     — extracted from the public ft9201-static blob.
 #
 # If either URL has moved, see the "Sourcing the blobs by hand" section of the
 # README: you only need those two files, and this script shows exactly what they
@@ -26,7 +26,7 @@ fi
 # --- 2. MCU firmware (ft9201-static public blob) ---
 FW_DEB="https://github.com/mrrbrilliant/ft9201-static/raw/main/libfprint_2_2_1_90_1%2Btod1_0ubuntu120_04_2_amd64_16c6e64404f8411.deb"
 if [ ! -f src/ft9201_fw.h ]; then
-  echo "==> fetching ft9201-static blob (for FT9348W MCU firmware)"
+  echo "==> fetching ft9201-static blob (for FT9338W MCU firmware)"
   curl -fSL -o blobs/ft9201-static.deb "$FW_DEB"
   ( cd blobs && ar x ft9201-static.deb && tar xf data.tar.* )
   SO="$(find blobs -name 'libfprint-2.so.2.0.0' | head -1)"

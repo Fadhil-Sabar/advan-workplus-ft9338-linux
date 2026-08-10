@@ -9,7 +9,8 @@ LIBFPRINT_REF="${LIBFPRINT_REF:-v1.94.10}"   # pinned, tested upstream release
 LFP=libfprint
 
 [ -f src/ft9201_fw.h ] || { echo "!! run scripts/fetch-blobs.sh first (missing firmware)"; exit 1; }
-[ -f blobs/ftWbioEngineAdapter.dll ] || { echo "!! run scripts/fetch-blobs.sh first (missing DLL)"; exit 1; }
+# The matcher DLL is only required for enroll/verify at runtime. Building and
+# hardware bring-up can proceed without it.
 
 if [ ! -d "$LFP" ]; then
   echo "==> cloning upstream libfprint @ $LIBFPRINT_REF"

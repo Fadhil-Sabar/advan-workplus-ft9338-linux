@@ -1,0 +1,11 @@
+LIBGUSB_0.1.0 {
+  global:
+    g_usb_device_get_interfaces;
+    g_usb_interface_get_protocol;
+    g_usb_interface_get_subclass;
+    g_usb_interface_get_class;
+    g_usb_interface_get_number;
+    g_usb_device_get_release;
+  local:
+    *;
+};

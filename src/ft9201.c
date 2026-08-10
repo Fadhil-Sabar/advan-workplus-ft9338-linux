@@ -14,7 +14,7 @@
  *   - Manual USB traffic analysis / binary disassembly
  *
  * Supported devices:
- *   2808:93a9 - Focal-systems.Corp FT9201Fingerprint (standalone USB reader)
+ *   2808:9338 - Focal-systems.Corp FT9201Fingerprint (FT9338W variant)
  *
  * Init sequence overview:
  *   1. WakeupSensor x2  (req=0x22, val=0x70, idx=0x70)
@@ -69,6 +69,7 @@
 #define REQ_AFE_READ            0x3a  /* IN  read AFE register */
 #define REQ_AFE_WRITE           0x3b  /* OUT write AFE register (val=value, idx=reg) */
 #define REQ_SENSOR_RESET        0x40  /* OUT hardware MCU reset */
+#define REQ_FT_COMMAND          0x6f  /* OUT command used by PID 9338 */
 
 /* AFE register indices */
 #define REG_DIM_W               0x14
@@ -86,8 +87,8 @@
 #define BULK_TIMEOUT            5000
 
 /* Sensor geometry fallback */
-#define DEFAULT_WIDTH           96
-#define DEFAULT_HEIGHT          96
+#define DEFAULT_WIDTH           64
+#define DEFAULT_HEIGHT          80
 
 /* Firmware chunk size */
 #define FW_CHUNK                64
@@ -184,6 +185,14 @@ ctrl_in (FpiSsm *ssm, FpDevice *dev,
 /* ================================================================== */
 
 enum {
+  /* PID 2808:9338 vendor handshake. The 32-byte reply contains the sensor
+   * identity and geometry; this device already runs its operational FW. */
+  INIT_9338_ARM1,
+  INIT_9338_SELECT,
+  INIT_9338_ARM2,
+  INIT_9338_INFO_CMD,
+  INIT_9338_INFO_READ,
+
   /* ---- preamble ---- */
   INIT_WAKE1,           /* WakeupSensor 1 */
   INIT_WAKE2,           /* WakeupSensor 2 */
@@ -210,11 +219,22 @@ enum {
   INIT_FW_WAKE1,        /* WakeupSensor before LoadFW */
   INIT_FW_WAKE2,
   INIT_FW_MCU_DL,       /* req=0x57 again */
+  INIT_FW_T1_C8,        /* FT9338W hw reg c8 = ff */
+  INIT_FW_T1_CA,        /* FT9338W hw reg ca = ff */
+  INIT_FW_T1_CB,        /* FT9338W hw reg cb = ff */
+  INIT_FW_T1_B9_BF,     /* FT9338W hw reg b9 = bf */
+  INIT_FW_T1_B9_FF,     /* FT9338W hw reg b9 = ff */
+  INIT_FW_T1_DELAY,     /* 20 ms */
   INIT_FW_RESET_EP,     /* req=0x34 val=0xff idx=0 */
   INIT_FW_DL_MODE,      /* req=0x34 val=0x02 idx=0 */
   INIT_FW_BRIDGE_VER,   /* req=0x1a read (GetBridgeVersion, ignored) */
   INIT_FW_CHUNK_SIZE,   /* req=0x35 val=64 idx=0 */
   INIT_FW_UPLOAD,       /* bulk-out loop: handled in state handler */
+  INIT_FW_SETTLE,       /* FT9338W: 2 ms after upload */
+  INIT_FW_VERIFY_RESET, /* req=0x34 val=ff */
+  INIT_FW_VERIFY_ARM,   /* req=0x34 val=03 */
+  INIT_FW_VERIFY_SIZE,  /* req=0x35 val=fw_size+2 */
+  INIT_FW_VERIFY_READ,  /* bulk-in firmware readback */
 
   /* ---- post-upload MCU config (from vendor blob: InitMcuConfig +
    *      SwitchNextSensorWorkMode) — this is what makes the MCU run the
@@ -230,8 +250,10 @@ enum {
   INIT_CFG_R1E,         /* reg 0x1e = 0x01 (power on) */
 
   /* ---- post-upload reset & MCU poll ---- */
-  INIT_SENSOR_RESET,    /* req=0x40 val=0 idx=0  ← the real MCU reset */
-  INIT_RESET_DELAY,     /* 160 ms sleep */
+  INIT_SENSOR_RESET,    /* first req=0x40 reset */
+  INIT_RESET_DELAY_10,  /* 10 ms */
+  INIT_SENSOR_RESET_2,  /* second req=0x40 reset */
+  INIT_RESET_DELAY,     /* FT9338W: 80 ms */
   INIT_POST_WAKE1,      /* WakeupSensor 1 */
   INIT_POST_WAKE2,      /* WakeupSensor 2 */
   INIT_MCU_WAIT,        /* 2 ms delay between polls */
@@ -249,6 +271,32 @@ enum {
 
   INIT_NUM_STATES,
 };
+
+static void
+info_9338_cb (FpiUsbTransfer *t, FpDevice *dev, gpointer ud, GError *err)
+{
+  FpiDeviceFt9201 *self = FPI_DEVICE_FT9201 (dev);
+
+  if (err)
+    {
+      fpi_ssm_mark_failed (t->ssm, err);
+      return;
+    }
+  if (t->actual_length < 25)
+    {
+      fpi_ssm_mark_failed (t->ssm,
+        fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
+                                  "ft9201: short sensor-info reply"));
+      return;
+    }
+
+  self->sensor_width = t->buffer[23] ? t->buffer[23] : DEFAULT_WIDTH;
+  self->sensor_height = t->buffer[24] ? t->buffer[24] : DEFAULT_HEIGHT;
+  fp_info ("ft9201: chip=%02x%02x manufacturer=%02x sensor=%ux%u",
+           t->buffer[20], t->buffer[19], t->buffer[22],
+           self->sensor_width, self->sensor_height);
+  fpi_ssm_mark_completed (t->ssm);
+}
 
 /* ---- preamble callbacks ---- */
 
@@ -286,11 +334,13 @@ spi_r_f3_cb (FpiUsbTransfer *t, FpDevice *dev, gpointer ud, GError *err)
   guint8 raw, type;
   if (err) { fpi_ssm_mark_failed (t->ssm, err); return; }
   raw  = t->buffer[0];
-  type = (raw >> 1) & 0x0f;
+  /* PID 9338 is the FT9338W/type-1 path. Its SPI type byte does not use the
+   * FT9348W encoding assumed by the original driver (it reports 0x16 here). */
+  type = 1;
   self->sensor_variant = type;
   fp_dbg ("ft9201: SPI type_raw=0x%02x  sensor_type=%u (%s)",
           raw, type,
-          type == 2 ? "FT9348W" : type == 3 ? "FT9348W(var)" :
+          type == 1 ? "FT9338W" : type == 2 ? "FT9348W" : type == 3 ? "FT9348W(var)" :
           type == 4 ? "FT9361W" : "unknown");
   fpi_ssm_next_state (t->ssm);
 }
@@ -303,8 +353,40 @@ fw_chunk_cb (FpiUsbTransfer *t, FpDevice *dev, gpointer ud, GError *err)
   FpiDeviceFt9201 *self = FPI_DEVICE_FT9201 (dev);
   if (err) { fpi_ssm_mark_failed (t->ssm, err); return; }
   self->fw_offset += FW_CHUNK;
-  /* stay in INIT_FW_UPLOAD — the state handler loops until done */
-  fpi_ssm_jump_to_state (t->ssm, INIT_FW_UPLOAD);
+  /* The vendor transport waits 1 ms after every 64-byte firmware write.
+   * The FT9338W drops/corrupts back-to-back chunks without this pacing. */
+  fpi_ssm_jump_to_state_delayed (t->ssm, INIT_FW_UPLOAD, 1);
+}
+
+static void
+fw_verify_cb (FpiUsbTransfer *t, FpDevice *dev, gpointer ud, GError *err)
+{
+  if (err)
+    {
+      fpi_ssm_mark_failed (t->ssm, err);
+      return;
+    }
+  if (t->actual_length < ft9201_fw_size ||
+      memcmp (t->buffer, ft9201_fw_data, ft9201_fw_size) != 0)
+    {
+      gsize mismatch = 0;
+      gsize comparable = MIN (t->actual_length, ft9201_fw_size);
+      while (mismatch < comparable &&
+             t->buffer[mismatch] == ft9201_fw_data[mismatch])
+        mismatch++;
+      fp_warn ("ft9201: firmware readback mismatch at %zu, actual_len=%zu; "
+               "got=%02x %02x %02x %02x expected=%02x %02x %02x %02x",
+               mismatch, t->actual_length,
+               t->buffer[0], t->buffer[1], t->buffer[2], t->buffer[3],
+               ft9201_fw_data[0], ft9201_fw_data[1],
+               ft9201_fw_data[2], ft9201_fw_data[3]);
+      fpi_ssm_mark_failed (t->ssm,
+        fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
+                                  "ft9201: firmware readback mismatch"));
+      return;
+    }
+  fp_dbg ("ft9201: firmware readback verified (%zu bytes)", ft9201_fw_size);
+  fpi_ssm_jump_to_state (t->ssm, INIT_SENSOR_RESET);
 }
 
 /* ---- MCU poll callback ---- */
@@ -315,6 +397,10 @@ mcu_poll_cb (FpiUsbTransfer *t, FpDevice *dev, gpointer ud, GError *err)
   FpiDeviceFt9201 *self = FPI_DEVICE_FT9201 (dev);
 
   if (err) { fpi_ssm_mark_failed (t->ssm, err); return; }
+
+  if (self->fw_retries == 0 || self->fw_retries % 25 == 0)
+    fp_dbg ("ft9201: MCU poll %u returned %02x %02x",
+            self->fw_retries + 1, t->buffer[0], t->buffer[1]);
 
   if (t->buffer[0] == 0xa5 && t->buffer[1] == 0x5a)
     {
@@ -367,6 +453,26 @@ init_ssm_run_state (FpiSsm *ssm, FpDevice *dev)
 
   switch (fpi_ssm_get_cur_state (ssm))
     {
+    case INIT_9338_ARM1:
+      ctrl_out (ssm, dev, REQ_BULK_ARM, 0x0003, 0x0000);
+      break;
+    case INIT_9338_SELECT:
+      ctrl_out (ssm, dev, REQ_FT_COMMAND, 0x0000, 0xff00);
+      break;
+    case INIT_9338_ARM2:
+      ctrl_out (ssm, dev, REQ_BULK_ARM, 0x0003, 0x0000);
+      break;
+    case INIT_9338_INFO_CMD:
+      ctrl_out (ssm, dev, REQ_FT_COMMAND, 0x0020, 0x9180);
+      break;
+    case INIT_9338_INFO_READ:
+      t = fpi_usb_transfer_new (dev);
+      t->ssm = ssm;
+      fpi_usb_transfer_fill_bulk (t, FT9201_EP_IN, 32);
+      fpi_usb_transfer_submit (t, BULK_TIMEOUT,
+        fpi_device_get_cancellable (dev), info_9338_cb, NULL);
+      break;
+
     /* --- preamble --- */
     case INIT_WAKE1:
       ctrl_out (ssm, dev, REQ_WAKEUP, 0x70, 0x70);
@@ -445,6 +551,24 @@ init_ssm_run_state (FpiSsm *ssm, FpDevice *dev)
     case INIT_FW_MCU_DL:
       ctrl_out (ssm, dev, REQ_MCU_DL_MODE, 0, 0);
       break;
+    case INIT_FW_T1_C8:
+      ctrl_out (ssm, dev, REQ_HW_REG, 0x00ff, 0x00c8);
+      break;
+    case INIT_FW_T1_CA:
+      ctrl_out (ssm, dev, REQ_HW_REG, 0x00ff, 0x00ca);
+      break;
+    case INIT_FW_T1_CB:
+      ctrl_out (ssm, dev, REQ_HW_REG, 0x00ff, 0x00cb);
+      break;
+    case INIT_FW_T1_B9_BF:
+      ctrl_out (ssm, dev, REQ_HW_REG, 0x00bf, 0x00b9);
+      break;
+    case INIT_FW_T1_B9_FF:
+      ctrl_out (ssm, dev, REQ_HW_REG, 0x00ff, 0x00b9);
+      break;
+    case INIT_FW_T1_DELAY:
+      fpi_ssm_next_state_delayed (ssm, 20);
+      break;
     case INIT_FW_RESET_EP:
       ctrl_out (ssm, dev, REQ_BULK_ARM, 0x00ff, 0x0000);
       break;
@@ -480,6 +604,26 @@ init_ssm_run_state (FpiSsm *ssm, FpDevice *dev)
       }
       break;
 
+    case INIT_FW_SETTLE:
+      fpi_ssm_next_state_delayed (ssm, 2);
+      break;
+    case INIT_FW_VERIFY_RESET:
+      ctrl_out (ssm, dev, REQ_BULK_ARM, 0x00ff, 0);
+      break;
+    case INIT_FW_VERIFY_ARM:
+      ctrl_out (ssm, dev, REQ_BULK_ARM, 0x0003, 0);
+      break;
+    case INIT_FW_VERIFY_SIZE:
+      ctrl_out (ssm, dev, REQ_BULK_SIZE, ft9201_fw_size + 2, 0);
+      break;
+    case INIT_FW_VERIFY_READ:
+      t = fpi_usb_transfer_new (dev);
+      t->ssm = ssm;
+      fpi_usb_transfer_fill_bulk (t, FT9201_EP_IN, ft9201_fw_size + 2);
+      fpi_usb_transfer_submit (t, BULK_TIMEOUT,
+        fpi_device_get_cancellable (dev), fw_verify_cb, NULL);
+      break;
+
     /* --- MCU config writes (make the uploaded firmware run) --- */
     case INIT_CFG_R01:
       ctrl_out (ssm, dev, REQ_AFE_WRITE, 0x01, 0x01);
@@ -494,27 +638,45 @@ init_ssm_run_state (FpiSsm *ssm, FpDevice *dev)
       ctrl_in (ssm, dev, REQ_AFE_READ, 0, 0x30, 1, ignore_read_cb);
       break;
     case INIT_CFG_R22:
-      ctrl_out (ssm, dev, REQ_AFE_WRITE, 0x00, 0x22);
+      if (self->sensor_variant == 2 || self->sensor_variant == 4)
+        ctrl_out (ssm, dev, REQ_AFE_WRITE, 0x00, 0x22);
+      else
+        fpi_ssm_next_state (ssm);
       break;
     case INIT_CFG_R23:
-      ctrl_out (ssm, dev, REQ_AFE_WRITE, 0x0e, 0x23);
+      if (self->sensor_variant == 2 || self->sensor_variant == 4)
+        ctrl_out (ssm, dev, REQ_AFE_WRITE, 0x0e, 0x23);
+      else
+        fpi_ssm_next_state (ssm);
       break;
     case INIT_CFG_R54:
       ctrl_out (ssm, dev, REQ_AFE_WRITE, 0x01, 0x54);
       break;
     case INIT_CFG_R1F:
-      ctrl_out (ssm, dev, REQ_AFE_WRITE, 0x01, 0x1f);
+      if (self->sensor_variant != 1)
+        ctrl_out (ssm, dev, REQ_AFE_WRITE, 0x01, 0x1f);
+      else
+        fpi_ssm_next_state (ssm);
       break;
     case INIT_CFG_R1E:
-      ctrl_out (ssm, dev, REQ_AFE_WRITE, 0x01, 0x1e);
+      if (self->sensor_variant != 1)
+        ctrl_out (ssm, dev, REQ_AFE_WRITE, 0x01, 0x1e);
+      else
+        fpi_ssm_next_state (ssm);
       break;
 
     /* --- post-config reset that starts the uploaded firmware --- */
     case INIT_SENSOR_RESET:
       ctrl_out (ssm, dev, REQ_SENSOR_RESET, 0, 0);
       break;
+    case INIT_RESET_DELAY_10:
+      fpi_ssm_next_state_delayed (ssm, 10);
+      break;
+    case INIT_SENSOR_RESET_2:
+      ctrl_out (ssm, dev, REQ_SENSOR_RESET, 0, 0);
+      break;
     case INIT_RESET_DELAY:
-      fpi_ssm_next_state_delayed (ssm, 160);
+      fpi_ssm_next_state_delayed (ssm, 80);
       break;
     case INIT_POST_WAKE1:
       ctrl_out (ssm, dev, REQ_WAKEUP, 0x70, 0x70);
@@ -601,6 +763,22 @@ init_ssm_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
 /* ================================================================== */
 
 enum {
+  SCAN_9338_WAIT_DELAY,
+  SCAN_9338_WAIT_FINGER,
+  SCAN_9338_STATUS_ARM1,
+  SCAN_9338_STATUS_CMD1,
+  SCAN_9338_STATUS_READ1,
+  SCAN_9338_SELECT_ARM,
+  SCAN_9338_SELECT,
+  SCAN_9338_STATUS_ARM2,
+  SCAN_9338_STATUS_CMD2,
+  SCAN_9338_STATUS_READ2,
+  SCAN_9338_CAPTURE_ARM,
+  SCAN_9338_CAPTURE_CMD,
+  SCAN_9338_CAPTURE_READ,
+  SCAN_9338_LIFT_DELAY,
+  SCAN_9338_WAIT_LIFT,
+
   /* Background (FPN) capture — runs at start of every scan cycle */
   SCAN_BG_RESET_EP,       /* 0xff reset for background capture */
   SCAN_BG_CAP_DELAY,      /* 20ms */
@@ -621,6 +799,53 @@ enum {
   SCAN_WAIT_LIFT,         /* read reg 0x1d; loop until != 0xa0 (finger gone) */
   SCAN_NUM_STATES,
 };
+
+static void
+finger_9338_cb (FpiUsbTransfer *t, FpDevice *dev, gpointer ud, GError *err)
+{
+  if (err) { fpi_ssm_mark_failed (t->ssm, err); return; }
+  if (t->buffer[0] == 1)
+    fpi_ssm_next_state (t->ssm);
+  else
+    fpi_ssm_jump_to_state (t->ssm, SCAN_9338_WAIT_DELAY);
+}
+
+static void
+status_9338_cb (FpiUsbTransfer *t, FpDevice *dev, gpointer ud, GError *err)
+{
+  if (err) { fpi_ssm_mark_failed (t->ssm, err); return; }
+  fpi_ssm_next_state (t->ssm);
+}
+
+static void
+image_9338_cb (FpiUsbTransfer *t, FpDevice *dev, gpointer ud, GError *err)
+{
+  FpiDeviceFt9201 *self = FPI_DEVICE_FT9201 (dev);
+  gsize size = (gsize) self->sensor_width * self->sensor_height;
+
+  if (err) { fpi_ssm_mark_failed (t->ssm, err); return; }
+  if (t->actual_length < (gssize) size)
+    {
+      fpi_ssm_mark_failed (t->ssm,
+        fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
+                                  "ft9201: short image frame"));
+      return;
+    }
+  memcpy (self->image_buf, t->buffer, size);
+  self->scan_ok = TRUE;
+  fp_info ("ft9201: captured %zu-byte 9338 frame", size);
+  fpi_ssm_next_state (t->ssm);
+}
+
+static void
+lift_9338_cb (FpiUsbTransfer *t, FpDevice *dev, gpointer ud, GError *err)
+{
+  if (err) { fpi_ssm_mark_failed (t->ssm, err); return; }
+  if (t->buffer[0] == 0)
+    fpi_ssm_mark_completed (t->ssm);
+  else
+    fpi_ssm_jump_to_state (t->ssm, SCAN_9338_LIFT_DELAY);
+}
 
 static void
 wait_lift_cb (FpiUsbTransfer *t, FpDevice *dev, gpointer ud, GError *err)
@@ -711,14 +936,67 @@ scan_ssm_run_state (FpiSsm *ssm, FpDevice *dev)
   FpiUsbTransfer *t;
   gsize total;
 
-  if (g_cancellable_is_cancelled (fpi_device_get_cancellable (dev)))
-    {
-      fpi_ssm_mark_completed (ssm);
-      return;
-    }
-
   switch (fpi_ssm_get_cur_state (ssm))
     {
+    case SCAN_9338_WAIT_DELAY:
+      fpi_ssm_next_state_delayed (ssm, 10);
+      break;
+    case SCAN_9338_WAIT_FINGER:
+      ctrl_in (ssm, dev, 0x43, 0, 0, 1, finger_9338_cb);
+      break;
+    case SCAN_9338_STATUS_ARM1:
+      ctrl_out (ssm, dev, REQ_BULK_ARM, 0x0003, 0);
+      break;
+    case SCAN_9338_STATUS_CMD1:
+      ctrl_out (ssm, dev, REQ_FT_COMMAND, 0x0020, 0x9180);
+      break;
+    case SCAN_9338_STATUS_READ1:
+      t = fpi_usb_transfer_new (dev);
+      t->ssm = ssm;
+      fpi_usb_transfer_fill_bulk (t, FT9201_EP_IN, 32);
+      fpi_usb_transfer_submit (t, BULK_TIMEOUT,
+        fpi_device_get_cancellable (dev), status_9338_cb, NULL);
+      break;
+    case SCAN_9338_SELECT_ARM:
+      ctrl_out (ssm, dev, REQ_BULK_ARM, 0x0003, 0);
+      break;
+    case SCAN_9338_SELECT:
+      ctrl_out (ssm, dev, REQ_FT_COMMAND, 0x0000, 0xff00);
+      break;
+    case SCAN_9338_STATUS_ARM2:
+      ctrl_out (ssm, dev, REQ_BULK_ARM, 0x0003, 0);
+      break;
+    case SCAN_9338_STATUS_CMD2:
+      ctrl_out (ssm, dev, REQ_FT_COMMAND, 0x0020, 0x9180);
+      break;
+    case SCAN_9338_STATUS_READ2:
+      t = fpi_usb_transfer_new (dev);
+      t->ssm = ssm;
+      fpi_usb_transfer_fill_bulk (t, FT9201_EP_IN, 32);
+      fpi_usb_transfer_submit (t, BULK_TIMEOUT,
+        fpi_device_get_cancellable (dev), status_9338_cb, NULL);
+      break;
+    case SCAN_9338_CAPTURE_ARM:
+      ctrl_out (ssm, dev, REQ_BULK_ARM, 0x0003, 0);
+      break;
+    case SCAN_9338_CAPTURE_CMD:
+      ctrl_out (ssm, dev, REQ_FT_COMMAND, 0x1400, 0x9080);
+      break;
+    case SCAN_9338_CAPTURE_READ:
+      total = (gsize) self->sensor_width * self->sensor_height;
+      t = fpi_usb_transfer_new (dev);
+      t->ssm = ssm;
+      fpi_usb_transfer_fill_bulk (t, FT9201_EP_IN, total);
+      fpi_usb_transfer_submit (t, BULK_TIMEOUT,
+        fpi_device_get_cancellable (dev), image_9338_cb, NULL);
+      break;
+    case SCAN_9338_LIFT_DELAY:
+      fpi_ssm_next_state_delayed (ssm, 20);
+      break;
+    case SCAN_9338_WAIT_LIFT:
+      ctrl_in (ssm, dev, 0x43, 0, 0, 1, lift_9338_cb);
+      break;
+
     case SCAN_BG_RESET_EP:
       ctrl_out (ssm, dev, REQ_BULK_ARM, 0xff, 0);
       break;
@@ -1077,7 +1355,7 @@ dev_verify (FpDevice *dev)
 /* ================================================================== */
 
 static const FpIdEntry id_table[] = {
-  { .vid = 0x2808, .pid = 0x93a9 },
+  { .vid = 0x2808, .pid = 0x9338 },
   { .vid = 0,      .pid = 0      },
 };
 
@@ -1095,7 +1373,9 @@ fpi_device_ft9201_class_init (FpiDeviceFt9201Class *klass)
   dev_class->full_name        = "Focal-systems FT9201 Fingerprint Reader";
   dev_class->type             = FP_DEVICE_TYPE_USB;
   dev_class->id_table         = id_table;
-  dev_class->nr_enroll_stages = 8;
+  /* The Windows engine advertises max_samples=18 and may report completion
+   * earlier once its coverage target is reached. */
+  dev_class->nr_enroll_stages = 18;
   dev_class->scan_type        = FP_SCAN_TYPE_PRESS;
   dev_class->temp_hot_seconds = -1;
 

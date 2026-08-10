@@ -12,7 +12,9 @@ DROPIN=/etc/systemd/system/fprintd.service.d/ft9201.conf
 if [ "${1:-}" = "--uninstall" ]; then
   [ "$(id -u)" = 0 ] || { echo "run with sudo"; exit 1; }
   rm -rf "$DEST"
-  rm -f "$DROPIN" /usr/lib/libfprint-2/ftWbioEngineAdapter.dll /etc/udev/rules.d/60-ft9201.rules
+  rm -f "$DROPIN" /usr/lib/libfprint-2/ftWbioEngineAdapter.dll \
+    /usr/lib/libfprint-2/ftWbioEngineAdapter.dll.image \
+    /etc/udev/rules.d/60-ft9201.rules
   systemctl daemon-reload || true; systemctl restart fprintd || true
   udevadm control --reload-rules || true
   echo "Uninstalled. The distro libfprint was never modified."
@@ -31,6 +33,12 @@ ln -sf libfprint-2.so.2.0.0 "$DEST/libfprint-2.so.2"
 
 echo "==> installing vendor matcher DLL"
 install -Dm644 blobs/ftWbioEngineAdapter.dll /usr/lib/libfprint-2/ftWbioEngineAdapter.dll
+python3 scripts/prepare-engine-image.py \
+  blobs/ftWbioEngineAdapter.dll blobs/ftWbioEngineAdapter.dll.image
+install -m644 blobs/ftWbioEngineAdapter.dll.image \
+  /usr/lib/libfprint-2/ftWbioEngineAdapter.dll.image
+restorecon -F /usr/lib/libfprint-2/ftWbioEngineAdapter.dll \
+  /usr/lib/libfprint-2/ftWbioEngineAdapter.dll.image 2>/dev/null || true
 
 echo "==> installing udev rule"
 install -Dm644 packaging/60-ft9201.rules /etc/udev/rules.d/60-ft9201.rules

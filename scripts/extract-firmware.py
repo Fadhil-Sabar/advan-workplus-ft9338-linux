@@ -7,7 +7,7 @@
 # Usage: extract-firmware.py <path-to-libfprint-2.so> [out.h]
 import struct, subprocess, sys
 
-SYM = "FOCALFP_9348_FW_APP"   # matches the FT9348W variant (device 2808:93a9)
+SYM = "FOCALFP_9338_FW_APP"   # matches the FT9338W variant (device 2808:9338)
 
 so  = sys.argv[1] if len(sys.argv) > 1 else "blobs/ft9201-static/libfprint-2.so.2.0.0"
 out = sys.argv[2] if len(sys.argv) > 2 else "src/ft9201_fw.h"
@@ -42,7 +42,7 @@ if foff is None:
 fw = data[foff:foff + size]
 
 with open(out, "w") as f:
-    f.write(f"/* FT9348W MCU firmware — extracted from ft9201-static ({SYM}).\n")
+    f.write(f"/* FT9338W MCU firmware — extracted from ft9201-static ({SYM}).\n")
     f.write(" * FocalTech proprietary; generated at build time, not committed. */\n")
     f.write("static const guint8 ft9201_fw_data[] = {\n")
     for i in range(0, len(fw), 12):

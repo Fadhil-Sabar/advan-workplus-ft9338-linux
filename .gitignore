@@ -5,3 +5,11 @@
 /libfprint/
 # misc
 *.o
+__pycache__/
+*.py[cod]
+
+# local reverse-engineering build products and captures
+/compat/*.so
+/compat/*.log
+/compat/vendor-open
+/compat/vendor-capture

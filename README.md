@@ -1,193 +1,284 @@
-# ft9201-libfprint
+# FT9201/FT9338 fingerprint support for Linux
 
-Linux fingerprint support for the **Focal-systems FT9201** USB reader
-(`2808:93a9`, sold as a standalone Windows Hello dongle), as a
-[libfprint](https://gitlab.freedesktop.org/libfprint/libfprint) driver.
+[Bahasa Indonesia](README.id.md)
 
-<p align="center">
-  <img src="docs/sensor.jpg" alt="Focal-systems FT9201 USB fingerprint reader" width="360">
-</p>
-
-The sensor is a tiny 96×96 optical reader. libfprint's built-in matcher does a
-poor job on an image that small, so this driver instead reuses **FocalTech's own
-matching engine** — the `ftWbioEngineAdapter.dll` from their signed Windows
-driver — running it natively on Linux with a small in-process PE loader. No Wine,
-no Windows, no cloud.
-
-> **This repo is also a reusable method, not just one driver.** The technique —
-> running a vendor's Windows matching engine natively on Linux, no Wine —
-> generalizes to other "Windows Hello only" readers, **including ones that ship an
-> SDCP secure channel** (the Synaptics/Goodix/ELAN/EgisTec-class crypto sensors),
-> via the optional [`src/crypto_shims.c`](src/crypto_shims.c) module. The FT9201 is
-> the worked example; the in-process loader, the WinBio bridge, and the
-> crypto-bypass layer carry over to the next device. See **[PORTING.md](PORTING.md)**
-> for the step-by-step method and what to reuse as-is.
+Linux support for the FocalTech USB fingerprint reader identified as
+`2808:9338`. The driver integrates with
+[libfprint](https://gitlab.freedesktop.org/libfprint/libfprint) and `fprintd`,
+so the reader can be used by desktop settings, PAM, and command-line tools.
 
 ## Status
 
-Working end-to-end on real hardware: enroll and verify through `fprintd` /
-command-line tools, and in KDE/GNOME once installed. It matches your finger
-using the vendor's real algorithm.
+Enrollment and verification work end-to-end on the tested hardware.
 
-Developed and tested against
-[this exact reader](https://www.amazon.com/dp/B0DK7LQZGH) (ASIN `B0DK7LQZGH`) —
-the FT9348W variant of `2808:93a9`.
+> **Hardware disclaimer:** this driver was developed and validated specifically
+> with the built-in fingerprint reader in an **Advan Workplus Ryzen 5 6600H**
+> laptop. Compatibility is determined by the USB ID and sensor revision, not by
+> the FT9201 product name alone. Success on other Advan Workplus revisions or
+> other laptops is not guaranteed.
 
-Caveats:
-- Tested only on that FT9348W variant of the `2808:93a9` device.
-- The matcher is a proprietary blob we call into; we can't fix bugs inside it.
-- x86-64 only (the DLL and loader are 64-bit).
+| Item | Tested value |
+| --- | --- |
+| Tested computer | Advan Workplus Ryzen 5 6600H |
+| USB ID | `2808:9338` |
+| Sensor chip | `0x6893` / FT9338W family |
+| Image | 64 x 80 pixels, 500 DPI |
+| Host architecture | x86-64 |
+| Tested distribution | Fedora |
+| Integration | libfprint, fprintd, KDE/GNOME, PAM |
 
-## How it works (short version)
+The final verification result on the test system was:
 
-- The USB init + firmware-boot sequence was reverse-engineered from FocalTech's
-  own drivers; the 8051 MCU firmware is uploaded, then a specific register-config
-  sequence starts it.
-- Each capture (96×96) is center-cropped to the 64×80 the engine expects.
-- `ft_engine.c` is a ~450-line loader that maps `ftWbioEngineAdapter.dll` into
-  memory, provides the ~90 `kernel32` functions it imports, sets up a fake
-  Windows TEB, and calls the engine's WinBio interface for enroll/verify.
-- The loader maps code read-execute and data read-write from an in-memory file,
-  so **no page is ever writable *and* executable**. That means it runs under
-  `fprintd`'s default `MemoryDenyWriteExecute` hardening — you do **not** have to
-  disable any security settings.
-
-See [`docs/how-it-works.md`](docs/how-it-works.md) for the full technical writeup.
-
-## Requirements
-
-Build tools + libfprint's build dependencies. On Fedora/Nobara:
-
-```
-sudo dnf install git meson ninja-build gcc cabextract python3 \
-     glib2-devel gusb-devel nss-devel pixman-devel gobject-introspection-devel \
-     libgudev-devel systemd-devel
+```text
+Verify result: verify-match (done)
 ```
 
-(Debian/Ubuntu: the equivalents — `libglib2.0-dev libgusb-dev libnss3-dev
-libpixman-1-dev libgudev-1.0-dev libsystemd-dev`, plus `cabextract`.)
+This repository targets the device above. Other FT9201 product IDs or sensor
+revisions may use a different protocol and are not automatically supported.
 
-## Build & install
+### Distribution support
 
+Only Fedora x86-64 has been verified on real hardware so far. The build and
+installation flow should also apply to other conventional x86-64 distributions,
+but those combinations are currently unverified.
+
+| Distribution | Current status |
+| --- | --- |
+| Fedora/Nobara | Fedora tested; Nobara expected to use the same flow |
+| Debian/Ubuntu | Expected to work; dependency names are documented below, but hardware testing is still needed |
+| Arch/Manjaro | Expected to work after installing equivalent packages; unverified |
+| openSUSE | Expected to work after installing equivalent `-devel` packages; unverified |
+| NixOS, Alpine, immutable systems, or non-systemd systems | The current installer requires adaptation |
+| ARM/AArch64 | Unsupported because the vendor matcher is an x86-64 DLL |
+
+The current installer assumes systemd, udev, `/etc/udev/rules.d`,
+`/usr/lib/libfprint-2`, and `/usr/local/lib/ft9201`. The driver source is less
+distribution-specific than the installer, so alternative layouts can be
+supported by adjusting `scripts/install.sh` or packaging the files natively.
+
+## Quick installation
+
+The repository includes a side-by-side installer. It leaves the distribution's
+libfprint files untouched.
+
+### 1. Install build dependencies
+
+Fedora:
+
+```bash
+sudo dnf install git meson ninja-build gcc curl cabextract python3 \
+  glib2-devel gusb-devel nss-devel pixman-devel libgudev-devel systemd-devel
 ```
-git clone https://github.com/OMGrant/ft9201-libfprint
-cd ft9201-libfprint
-scripts/fetch-blobs.sh     # pull the vendor DLL + MCU firmware (see note below)
-scripts/build.sh           # clone pinned libfprint, graft the driver in, build
+
+Debian/Ubuntu equivalents:
+
+```bash
+sudo apt install git meson ninja-build gcc curl cabextract python3 \
+  libglib2.0-dev libgusb-dev libnss3-dev libpixman-1-dev \
+  libgudev-1.0-dev libsystemd-dev
 ```
 
-Try it without installing anything:
+### 2. Fetch the required vendor files
 
-```
-FT9201_ENGINE_DLL=$PWD/blobs/ftWbioEngineAdapter.dll \
-LD_LIBRARY_PATH=libfprint/build/libfprint \
-libfprint/build/examples/enroll
+From this repository checkout:
+
+```bash
+./scripts/fetch-blobs.sh
 ```
 
-Install it for KDE/GNOME/login (side-by-side; your distro's libfprint is left
-alone, no hardening disabled):
+The script downloads the FocalTech matcher from its signed Windows driver and
+generates the firmware header currently required by the source tree. No
+proprietary binary is committed to this repository.
 
+### 3. Build
+
+```bash
+./scripts/build.sh
 ```
-sudo scripts/install.sh
+
+This downloads the tested libfprint release, registers the FT9201 driver, and
+builds the library plus its enrollment and verification examples.
+
+### 4. Install for fprintd
+
+```bash
+sudo ./scripts/install.sh
+```
+
+The installer:
+
+- installs the custom libfprint under `/usr/local/lib/ft9201`;
+- installs the vendor matcher and its W^X-safe prepared image;
+- installs the udev rule for the reader;
+- adds an `fprintd` systemd drop-in pointing only that service at the custom
+  library; and
+- reloads udev and restarts `fprintd`.
+
+The distribution-owned libfprint remains unchanged.
+
+### 5. Enroll a finger
+
+```bash
 fprintd-enroll
 ```
 
-Undo everything: `sudo scripts/install.sh --uninstall`.
+Enrollment can require up to 18 accepted samples. Continue until the command
+reports `enroll-completed`; partial `enroll-stage-passed` output is not yet a
+saved fingerprint.
 
-## The proprietary blobs
+For reliable samples:
 
-This repo contains **no** proprietary binaries. Two files are FocalTech's and are
-fetched from existing public sources at build time by `scripts/fetch-blobs.sh`:
+- touch, then fully remove the finger before the next sample;
+- vary the position slightly to cover the center and edges;
+- keep the sensor and finger clean and dry; and
+- do not repeatedly press the exact same area.
 
-| File | What it is | Where it comes from |
-|------|------------|---------------------|
-| `ftWbioEngineAdapter.dll` | the matching engine | FocalTech's signed Windows driver on the Microsoft Update Catalog |
-| FT9348W MCU firmware (`src/ft9201_fw.h`) | 8051 firmware the sensor runs | extracted (symbol `FOCALFP_9348_FW_APP`) from the public [`ft9201-static`](https://github.com/mrrbrilliant/ft9201-static) blob |
+### 6. Verify
 
-### Sourcing the blobs by hand
+```bash
+fprintd-verify
+```
 
-If either download URL has moved, you only need those two files:
+A successful setup ends with:
 
-- **`ftWbioEngineAdapter.dll`** — search the Microsoft Update Catalog for
-  *"FocalTech Electronics Biometric"* (driver 1.0.3.58, matches hardware ID
-  `USB\VID_2808&PID_93A9`). Download the `.cab`, extract with `cabextract`, and
-  drop `ftWbioEngineAdapter.dll` into `blobs/`.
-- **MCU firmware** — get any copy of the FocalTech Linux libfprint blob that
-  contains the `FOCALFP_9348_FW_APP` symbol (e.g. from `ft9201-static`) and run
-  `python3 scripts/extract-firmware.py <that-libfprint-2.so> src/ft9201_fw.h`.
+```text
+Verify result: verify-match (done)
+```
 
-Then re-run `scripts/build.sh`.
+You can then enable fingerprint authentication in KDE or GNOME user settings.
+
+## Test without installing
+
+After building, the libfprint examples can be run directly:
+
+```bash
+sudo env \
+  FT9201_ENGINE_DLL="$PWD/blobs/ftWbioEngineAdapter.dll" \
+  LD_LIBRARY_PATH="$PWD/libfprint/build/libfprint" \
+  "$PWD/libfprint/build/examples/enroll"
+```
+
+Then verify with:
+
+```bash
+sudo env \
+  FT9201_ENGINE_DLL="$PWD/blobs/ftWbioEngineAdapter.dll" \
+  LD_LIBRARY_PATH="$PWD/libfprint/build/libfprint" \
+  "$PWD/libfprint/build/examples/verify"
+```
+
+Templates created by a root-run example belong to root and are separate from
+the normal user's fprintd enrollment. Use `fprintd-enroll` for desktop and PAM
+integration.
+
+## How it works
+
+The working `2808:9338` path performs these operations:
+
+1. Initialize the USB bridge and identify the FT9338W-family sensor.
+2. Poll the sensor until a finger is detected.
+3. Capture one 5120-byte frame, representing a 64 x 80 grayscale image.
+4. Pass the frame to FocalTech's `ftWbioEngineAdapter.dll` through the native
+   in-process PE/WinBio compatibility layer.
+5. Return enrollment or match results through the normal libfprint API.
+
+No Wine process or Windows installation is required. The loader prepares a
+file-backed image whose code pages are read/execute and whose writable data is
+private read/write. It therefore remains compatible with fprintd's
+`MemoryDenyWriteExecute` hardening and SELinux; security hardening does not need
+to be disabled.
+
+The active `2808:9338` capture path does not upload the legacy MCU firmware.
+The generated firmware header remains a build dependency because the source
+tree still contains the earlier bring-up path.
+
+For the investigation history and protocol details, see
+[FT9201-9338-WRAP-UP.md](FT9201-9338-WRAP-UP.md). That document is currently in
+Indonesian. General notes about adapting the method to another device are in
+[PORTING.md](PORTING.md).
+
+## Troubleshooting
+
+### Repeated `enroll-remove-and-retry`
+
+Remove the finger completely between samples. If it continues, clean the sensor
+with a dry microfiber cloth and dry the finger. In testing, oil on the sensor
+caused long retry loops even though image capture itself was working.
+
+### `NoEnrolledPrints` during verification
+
+Enrollment did not reach its final commit, or it was performed as another user.
+Run `fprintd-enroll` again as the same user and wait for `enroll-completed`.
+
+### `enroll-unknown-error` or fprintd disconnects
+
+Inspect the service log:
+
+```bash
+sudo journalctl -u fprintd --since "5 minutes ago" --no-pager
+```
+
+Reinstall the current build and restart the daemon:
+
+```bash
+sudo ./scripts/install.sh
+sudo systemctl restart fprintd
+```
+
+### SELinux reports a write to `/memfd:ftengine (deleted)`
+
+That message is associated with the older in-memory loader. Rebuild and rerun
+the installer so that `ftWbioEngineAdapter.dll.image` is generated and
+installed. The current loader uses that W^X-safe file-backed image.
+
+## Uninstall
+
+```bash
+sudo ./scripts/install.sh --uninstall
+```
+
+This removes the side-by-side library, matcher files, udev rule, and systemd
+drop-in. It does not need to restore the distribution's libfprint because that
+library was never replaced.
+
+## Proprietary components
+
+The repository does not redistribute FocalTech binaries. The fetch script
+retrieves:
+
+| File | Purpose | Source |
+| --- | --- | --- |
+| `ftWbioEngineAdapter.dll` | Enrollment and matching engine | FocalTech signed Windows driver from Microsoft Update Catalog |
+| `src/ft9201_fw.h` | Legacy build-time firmware header | Extracted from the community-hosted FocalTech Linux package |
+
+The matcher is proprietary and x86-64-only. The open driver and compatibility
+loader cannot correct defects inside the vendor algorithm.
+
+### Windows driver reference
+
+The matcher used by this project comes from FocalTech's signed Windows biometric
+driver. `scripts/fetch-blobs.sh` downloads the package directly from Microsoft's
+Windows Update CDN:
+
+- [Microsoft Update Catalog search: FocalTech Electronics Biometric](https://www.catalog.update.microsoft.com/Search.aspx?q=FocalTech%20Electronics%20Biometric)
+- [Exact Microsoft CAB used by the fetch script](https://catalog.s.download.windowsupdate.com/d/msdownload/update/driver/drvs/2023/05/fd237921-f610-43de-b77c-f1685416480b_710b4d2c8dd2e80043e371b91bebb1721b5163a0.cab)
+
+The CAB is used only as the source of `ftWbioEngineAdapter.dll`. Installing that
+Windows driver package on Linux is neither required nor supported.
 
 ## Credits
 
-- USB protocol originally reverse-engineered by
-  [banianitc/ft9201-fingerprint-driver](https://github.com/banianitc/ft9201-fingerprint-driver).
-- Firmware and the init/boot sequence cross-referenced against FocalTech's Linux
-  blob via [mrrbrilliant/ft9201-static](https://github.com/mrrbrilliant/ft9201-static).
-- Built on [libfprint](https://gitlab.freedesktop.org/libfprint/libfprint).
-
-The reusable method and crypto-sensor path additionally build on the work of:
-
-- **[uunicorn](https://github.com/uunicorn)** — whose
-  [synaWudfBioUsb-sandbox](https://github.com/uunicorn/synaWudfBioUsb-sandbox) and
-  [wine fork](https://github.com/uunicorn/wine) are the harness for tracing a
-  vendor's Windows biometric driver under Wine, which is how a crypto sensor's
-  command protocol gets recovered without a Windows box.
-- **Marco Trevisan ([3v1n0](https://github.com/3v1n0))**, a libfprint maintainer —
-  who pointed the way to that Wine-tracing approach, and whose push to improve
-  libfprint's own matching upstream frames why the vendor-matcher route exists at
-  all.
-- **[championswimmer/libfprint-eh577](https://github.com/championswimmer/libfprint-eh577)**
-  — prior art for the EgisTec EH577 sensor family.
-
-## Other ways to run an FT9201 on Linux
-
-This isn't the only approach — the alternatives differ mainly in *how* they reuse
-FocalTech's matcher (they all do; the tiny sensor rules out generic matching).
-
-- **[Romk-a/ft9201-linux-setup](https://github.com/Romk-a/ft9201-linux-setup)** — a
-  Debian/Ubuntu (Astra Linux) guide that installs FocalTech's **prebuilt
-  proprietary Linux "TOD" driver** (from
-  [ryenyuku/libfprint-ft9201](https://github.com/ryenyuku/libfprint-ft9201); Fedora
-  RPMs have existed too) and binary-patches its USB-ID table (`9338` → `93a9`).
-  - **How it compares:** that route is *less work* — install a `.deb`, patch two
-    bytes, no reverse-engineering. But it needs **TOD-enabled libfprint**
-    (Debian/Ubuntu-family; **not** on stock Fedora/Arch), it **replaces your entire
-    system `libfprint`** with an old, fully-closed build, and you have to fight the
-    package manager to keep it pinned. This project instead ships an **open** driver,
-    installs **side-by-side** (your distro's libfprint is untouched), runs on
-    **mainline libfprint with no TOD**, and loads only the isolated vendor *matcher*
-    DLL — which is what all the reverse-engineering bought.
-  - **Short version:** on Debian/Ubuntu, the TOD route is the easy button; on
-    Fedora/Arch, or if you want it open and non-invasive, use this.
-- **Kernel drivers** exist ([banianitc](https://github.com/banianitc/ft9201-fingerprint-driver)
-  — the protocol reference this project reverse-engineered from,
-  [bm16ton/ft92010x9338](https://github.com/bm16ton/ft92010x9338)) but they don't
-  integrate with libfprint/fprintd, so there's no login/PAM support.
-
-The proprietary Linux TOD driver those `.deb`/RPM packages redistribute appears to
-have been a FocalTech/GPD release for the GPD Win 4 that was later **pulled from
-official distribution** — which is why it now survives only as community re-hosts.
-(Note also that some GPD Win 4 units ship a different sensor entirely, a Chipsailing
-CS9711, not this FocalTech part.)
-
-## Related projects
-
-- [championswimmer/libfprint-eh577](https://github.com/championswimmer/libfprint-eh577)
-  — a Linux driver effort for the **EgisTec EH577** (`1c7a:0577`), another
-  press-type "Windows Hello only" reader (52×72 active sensor). Different vendor
-  and USB protocol, but the same *match-on-host* shape: its Windows package ships
-  a vendor engine adapter DLL (`EgisTouchFPEngine0577.dll`, no VBS enclave), so
-  the method in **[PORTING.md](PORTING.md)** applies to it too.
-- **[OMGrant/eh577-libfprint](https://github.com/OMGrant/eh577-libfprint)** — this
-  method carried end-to-end to the **EgisTec EH577** and published as a working
-  driver. The §3b crypto techniques were validated against its SDCP builds; the
-  distributed driver targets a *pre-SDCP* Catalog build (a pure-software matcher —
-  see §3b's note on build selection), enrolling and verifying real fingers on Linux.
+- [libfprint](https://gitlab.freedesktop.org/libfprint/libfprint) for the Linux
+  fingerprint framework.
+- [banianitc/ft9201-fingerprint-driver](https://github.com/banianitc/ft9201-fingerprint-driver)
+  for earlier FT9201 protocol research.
+- [mrrbrilliant/ft9201-static](https://github.com/mrrbrilliant/ft9201-static)
+  for the archived FocalTech Linux package used as a reference.
+- [uunicorn/synaWudfBioUsb-sandbox](https://github.com/uunicorn/synaWudfBioUsb-sandbox)
+  and related work for Windows biometric-driver tracing techniques.
 
 ## License
 
-The driver and loader (`src/`, `scripts/`) are **LGPL-2.1-or-later**, matching
-libfprint. The FocalTech DLL and firmware are their own property and are not
-distributed here — you fetch them yourself. This project is an interoperability
-tool for hardware you own; it does not include or relicense any FocalTech code.
+The driver, loader, and scripts in this repository are licensed under
+LGPL-2.1-or-later, matching libfprint. FocalTech's DLL and firmware remain the
+property of their respective owner and are not relicensed or distributed here.

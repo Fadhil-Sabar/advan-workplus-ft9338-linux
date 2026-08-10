@@ -211,57 +211,28 @@ static int load_pe(void){
 
   u32 hdrsize=f32(e+24+60); // SizeOfHeaders
 
-  /* Prepare the fully-resolved image in a scratch buffer (writable, NOT
-   * executable), then map it back from an anonymous FILE (memfd) with per-section
-   * protections. This keeps code read+execute and data read+write, so no page is
-   * ever writable AND executable at once — which lets the engine run under
-   * fprintd's MemoryDenyWriteExecute=yes hardening (no systemd override needed).
-   * The DLL loads at its preferred base 0x180000000, so no relocations are
-   * required. */
-  u8 *img=calloc(1,sizeofimage);
-  if(!img){ perror("calloc"); return -1; }
-  memcpy(img,g_file,hdrsize);
-  for(int i=0;i<nsec;i++){
-    u64 s=sectbl+i*40;
-    u32 vaddr=f32(s+12), rawsize=f32(s+16), rawptr=f32(s+20);
-    memcpy(img+vaddr, g_file+rawptr, rawsize);
-  }
-
-  /* resolve kernel32 imports into the IAT within the scratch buffer */
-  u32 imprva=f32(e+24+112+8*1);
-  for(u64 d=imprva;;d+=20){
-    u32 orig=*(u32*)(img+d), namer=*(u32*)(img+d+12), fthunk=*(u32*)(img+d+16);
-    if(namer==0) break;
-    u64 rt=orig?orig:fthunk;
-    for(int j=0;;j++){
-      u64 ent=*(u64*)(img+rt+j*8);
-      if(!ent) break;
-      u64 *slot=(u64*)(img+fthunk+j*8);
-      if(ent>>63){ *slot=0; continue; } // by ordinal: none needed
-      const char*fn=(char*)(img+(ent&0x7fffffff)+2);
-      void*sh=find_shim(fn);
-      if(!sh) fprintf(stderr,"[loader] MISSING shim: %s\n",fn);
-      *slot=(u64)sh;
-    }
-  }
-
-  /* write the prepared image to an anonymous in-memory file */
-  int mfd=memfd_create("ftengine",MFD_CLOEXEC);
-  if(mfd<0){ perror("memfd_create"); free(img); return -1; }
-  ssize_t wr=write(mfd,img,sizeofimage);
-  free(img);
-  if(wr!=(ssize_t)sizeofimage){ perror("write memfd"); close(mfd); return -1; }
+  /* The sidecar is laid out by RVA during installation. Mapping executable
+   * pages from this read-only file avoids an executable memfd, which SELinux
+   * rejects for fprintd. Imports live in non-executable private RW pages and
+   * are resolved after mapping. */
+  size_t imagepath_len=strlen(g_dllpath)+7;
+  char *imagepath=malloc(imagepath_len);
+  if(!imagepath) return -1;
+  snprintf(imagepath,imagepath_len,"%s.image",g_dllpath);
+  int imagefd=open(imagepath,O_RDONLY);
+  if(imagefd<0){ perror("open engine image"); free(imagepath); return -1; }
+  free(imagepath);
 
   /* reserve the preferred base, then map each section from the file (W^X-safe) */
   void *m=mmap((void*)g_imagebase,sizeofimage,PROT_NONE,
                MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED_NOREPLACE,-1,0);
   if(m==MAP_FAILED || m!=(void*)g_imagebase){
-    fprintf(stderr,"[loader] reserve @%#lx failed (%p)\n",g_imagebase,m); close(mfd); return -1;
+    fprintf(stderr,"[loader] reserve @%#lx failed (%p)\n",g_imagebase,m); close(imagefd); return -1;
   }
   g_image=m;
   u32 hdrmap=(hdrsize+0xfff)&~0xfffu;
-  if(mmap(g_image,hdrmap,PROT_READ,MAP_PRIVATE|MAP_FIXED,mfd,0)==MAP_FAILED){
-    perror("[loader] map headers"); close(mfd); return -1;
+  if(mmap(g_image,hdrmap,PROT_READ,MAP_PRIVATE|MAP_FIXED,imagefd,0)==MAP_FAILED){
+    perror("[loader] map headers"); close(imagefd); return -1;
   }
   for(int i=0;i<nsec;i++){
     u64 s=sectbl+i*40;
@@ -271,12 +242,30 @@ static int load_pe(void){
     if(!seglen) continue;
     int prot=PROT_READ;
     if(chars&0x20000000) prot|=PROT_EXEC;   // IMAGE_SCN_MEM_EXECUTE
-    if(chars&0x80000000) prot|=PROT_WRITE;  // IMAGE_SCN_MEM_WRITE
-    if(mmap(g_image+vaddr,seglen,prot,MAP_PRIVATE|MAP_FIXED,mfd,vaddr)==MAP_FAILED){
-      perror("[loader] map section"); close(mfd); return -1;
+    else prot|=PROT_WRITE;                   // private data/IAT, never executable
+    if(mmap(g_image+vaddr,seglen,prot,MAP_PRIVATE|MAP_FIXED,imagefd,vaddr)==MAP_FAILED){
+      perror("[loader] map section"); close(imagefd); return -1;
     }
   }
-  close(mfd);
+  close(imagefd);
+
+  /* Resolve kernel32 imports in the mapped, non-executable IAT. */
+  u32 imprva=f32(e+24+112+8*1);
+  for(u64 d=imprva;;d+=20){
+    u32 orig=*(u32*)(g_image+d), namer=*(u32*)(g_image+d+12), fthunk=*(u32*)(g_image+d+16);
+    if(namer==0) break;
+    u64 rt=orig?orig:fthunk;
+    for(int j=0;;j++){
+      u64 ent=*(u64*)(g_image+rt+j*8);
+      if(!ent) break;
+      u64 *slot=(u64*)(g_image+fthunk+j*8);
+      if(ent>>63){ *slot=0; continue; }
+      const char*fn=(char*)(g_image+(ent&0x7fffffff)+2);
+      void*sh=find_shim(fn);
+      if(!sh) fprintf(stderr,"[loader] MISSING shim: %s\n",fn);
+      *slot=(u64)sh;
+    }
+  }
   fprintf(stderr,"[loader] file-backed image at %#lx (no W+X), entry RVA %#x\n",g_imagebase,entry);
 
   // TLS setup (dir 9): copy template, wire teb->tls array
