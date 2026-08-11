@@ -114,6 +114,7 @@ struct _FpiDeviceFt9201
   guint     enroll_done;      /* enrollment stages completed */
   FpPrint  *cur_print;        /* FpPrint being enrolled or verified against */
   gboolean  is_verify;        /* current operation type */
+  gboolean  is_identify;      /* identify against the enrolled print gallery */
   gboolean  scan_ok;          /* SCAN_SUBMIT sets TRUE if image was accepted */
 
   /* Vendor engine (ft_engine): opaque template blob for verify */
@@ -1120,10 +1121,19 @@ scan_ssm_run_state (FpiSsm *ssm, FpDevice *dev)
 }
 
 /* ================================================================== */
-/* Scan SSM completion → enroll / verify dispatch                      */
+/* Scan SSM completion → enroll / verify / identify dispatch            */
 /* ================================================================== */
 
 static void start_scan (FpDevice *dev);  /* forward declaration */
+
+static void
+report_identify_retry (FpDevice *dev, FpDeviceRetry retry)
+{
+  GError *error = fpi_device_retry_new (retry);
+
+  fpi_device_identify_report (dev, NULL, NULL, error);
+  fpi_device_identify_complete (dev, NULL);
+}
 
 static void
 scan_ssm_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
@@ -1133,7 +1143,14 @@ scan_ssm_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
 
   if (error)
     {
-      if (self->is_verify)
+      if (self->is_identify)
+        {
+          if (error && error->domain == FP_DEVICE_RETRY)
+            fpi_device_identify_report (dev, NULL, NULL,
+                                        g_steal_pointer (&error));
+          fpi_device_identify_complete (dev, error);
+        }
+      else if (self->is_verify)
         fpi_device_verify_complete (dev, error);
       else
         fpi_device_enroll_complete (dev, NULL, error);
@@ -1144,6 +1161,11 @@ scan_ssm_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
     {
       /* Bad scan. During verify, a report IS the result — so silently re-scan
        * instead of reporting, and only report once we have a real match. */
+      if (self->is_identify)
+        {
+          report_identify_retry (dev, FP_DEVICE_RETRY_CENTER_FINGER);
+          return;
+        }
       if (self->is_verify)
         {
           start_scan (dev);
@@ -1161,7 +1183,9 @@ scan_ssm_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
     {
       GError *e = fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
                                             "ft9201: vendor engine not loaded");
-      if (self->is_verify)
+      if (self->is_identify)
+        fpi_device_identify_complete (dev, e);
+      else if (self->is_verify)
         fpi_device_verify_complete (dev, e);
       else
         fpi_device_enroll_complete (dev, NULL, e);
@@ -1170,11 +1194,16 @@ scan_ssm_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
 
   /* Feed the raw captured frame to the vendor engine (it resizes internally). */
   uint32_t ahr = ft_engine_accept (self->image_buf, w, h,
-                                    self->is_verify ? 1 : 4);
+                                    (self->is_verify || self->is_identify) ? 1 : 4);
   if (ahr != 0)
     {
       /* Engine rejected the frame (quality/format). Verify: silent re-scan.
        * Enroll: report a retry for this stage. */
+      if (self->is_identify)
+        {
+          report_identify_retry (dev, FP_DEVICE_RETRY_CENTER_FINGER);
+          return;
+        }
       if (self->is_verify)
         {
           start_scan (dev);
@@ -1183,6 +1212,57 @@ scan_ssm_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
       GError *retry = fpi_device_retry_new (FP_DEVICE_RETRY_CENTER_FINGER);
       fpi_device_enroll_progress (dev, self->enroll_done, NULL, g_steal_pointer (&retry));
       start_scan (dev);
+      return;
+    }
+
+  if (self->is_identify)
+    {
+      GPtrArray *prints = NULL;
+      FpPrint *match = NULL;
+
+      fpi_device_get_identify_data (dev, &prints);
+
+      for (guint i = 0; i < prints->len; i++)
+        {
+          FpPrint *candidate = g_ptr_array_index (prints, i);
+          GVariant *data = NULL;
+          GVariant *arr = NULL;
+          gsize stored_len = 0;
+          const guint8 *stored;
+
+          g_object_get (candidate, "fpi-data", &data, NULL);
+          if (!data || !g_variant_check_format_string (data, "(@ay)", FALSE))
+            {
+              if (data)
+                g_variant_unref (data);
+              fpi_device_identify_complete (dev,
+                fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_INVALID,
+                                          "ft9201: stored template invalid"));
+              return;
+            }
+
+          g_variant_get (data, "(@ay)", &arr);
+          stored = g_variant_get_fixed_array (arr, &stored_len, 1);
+          if (stored_len > 0 && ft_engine_verify (stored, stored_len))
+            match = candidate;
+
+          g_variant_unref (arr);
+          g_variant_unref (data);
+
+          if (match)
+            break;
+        }
+
+      if (match)
+        fp_info ("ft9201: engine identify -> MATCH (finger=%d)",
+                 fp_print_get_finger (match));
+      else
+        fp_info ("ft9201: engine identify -> no match");
+
+      /* The vendor engine reports the match directly; a scanned FpPrint is
+       * not needed for login verification. */
+      fpi_device_identify_report (dev, match, NULL, NULL);
+      fpi_device_identify_complete (dev, NULL);
       return;
     }
 
@@ -1301,6 +1381,7 @@ dev_enroll (FpDevice *dev)
   gsize img_bytes = (gsize) self->sensor_width * self->sensor_height;
 
   self->is_verify    = FALSE;
+  self->is_identify  = FALSE;
   self->enroll_done  = 0;
   self->has_background = FALSE;
   (void) img_bytes;
@@ -1319,6 +1400,7 @@ dev_verify (FpDevice *dev)
   gsize img_bytes = (gsize) self->sensor_width * self->sensor_height;
 
   (void) img_bytes;
+  self->is_identify = FALSE;
   fpi_device_get_verify_data (dev, &self->cur_print);
 
   /* Load the opaque engine template blob from the stored print. */
@@ -1346,6 +1428,17 @@ dev_verify (FpDevice *dev)
   g_variant_unref (data);
 
   self->is_verify      = TRUE;
+  self->has_background = FALSE;
+  start_scan (dev);
+}
+
+static void
+dev_identify (FpDevice *dev)
+{
+  FpiDeviceFt9201 *self = FPI_DEVICE_FT9201 (dev);
+
+  self->is_verify   = FALSE;
+  self->is_identify = TRUE;
   self->has_background = FALSE;
   start_scan (dev);
 }
@@ -1383,6 +1476,7 @@ fpi_device_ft9201_class_init (FpiDeviceFt9201Class *klass)
   dev_class->close   = dev_close;
   dev_class->enroll  = dev_enroll;
   dev_class->verify  = dev_verify;
+  dev_class->identify = dev_identify;
   dev_class->cancel  = dev_cancel;
 
   fpi_device_class_auto_initialize_features (dev_class);
