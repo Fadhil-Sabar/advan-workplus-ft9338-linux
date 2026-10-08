@@ -13,7 +13,9 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdarg.h>
+#include <errno.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
@@ -36,10 +38,84 @@ typedef struct {
 typedef struct { u8 Name[8]; u32 VSize, VAddr, RawSize, RawPtr; u32 pad[3]; u16 pad2[2]; u32 Chars; } SEC;
 #pragma pack(pop)
 
-static u8 *g_file; static long g_filelen;
-static u32 f32(u64 o){ return *(u32*)(g_file+o); }
-static u64 f64(u64 o){ return *(u64*)(g_file+o); }
-static u16 f16(u64 o){ return *(u16*)(g_file+o); }
+static u8 *g_file; static size_t g_filelen;
+static u32 f32(u64 o);
+static u16 f16(u64 o);
+static int file_range(u64 o,u64 n){ return o<=g_filelen && n<=g_filelen-o; }
+static u32 g_image_size;
+static int image_writable_range(u64 o,u64 n);
+static size_t readable_range_length(u64 o);
+/* Require a request to fit wholly within one mapped region; SizeOfImage also
+ * contains alignment gaps that intentionally remain PROT_NONE. */
+static int image_range(u64 o,u64 n){
+  if(!g_image || o>g_image_size || n>g_image_size-o) return 0;
+  if(!n) return 1;
+  u64 end=o+n;
+  u64 cursor=o;
+  while(cursor<end){
+    u64 region_end=0;
+    u64 hdrmap=0;
+    /* Header mapping is rounded to pages; section ranges are similarly
+     * rounded and may overlap due to PE section alignment. */
+    u32 e=f32(0x3c), opt=e+24;
+    u32 hdrsize=f32(opt+60);
+    hdrmap=((u64)hdrsize+0xfff)&~0xfffULL;
+    if(cursor<hdrmap) region_end=hdrmap;
+    else {
+      u16 nsec=f16(e+6), optsize=f16(e+20);
+      u64 sectbl=(u64)e+24+optsize;
+      for(u32 i=0;i<nsec;i++){
+        u64 s=sectbl+(u64)i*40;
+        u64 va=f32(s+12), span=f32(s+8), raw=f32(s+16);
+        if(raw>span) span=raw;
+        u64 rounded=(span+0xfff)&~0xfffULL;
+        if(cursor>=va && cursor<va+rounded && va+rounded>region_end) region_end=va+rounded;
+      }
+    }
+    if(region_end<=cursor) return 0;
+    cursor=region_end<end?region_end:end;
+  }
+  return 1;
+}
+static int image_writable_range(u64 o,u64 n){
+  if(!image_range(o,n)) return 0;
+  u64 end=o+n;
+  u32 e=f32(0x3c), optsize=f16(e+20), nsec=f16(e+6);
+  u64 sectbl=(u64)e+24+optsize;
+  for(u64 cursor=o;cursor<end;){
+    int covered=0; u64 best=cursor;
+    for(u32 i=0;i<nsec;i++){
+        u64 s=sectbl+(u64)i*40, va=f32(s+12), span=f32(s+8), raw=f32(s+16), ch=f32(s+36);
+      if(raw>span) span=raw;
+      u64 lim=va+((span+0xfff)&~0xfffULL);
+      if(cursor>=va && cursor<lim){ covered=1; if(lim>best) best=lim; }
+      (void)ch;
+    }
+    if(!covered || best<=cursor) return 0;
+    cursor=best<end?best:end;
+  }
+  return 1;
+}
+static size_t readable_range_length(u64 o){
+  if(!image_range(o,1)) return 0;
+  u32 e=f32(0x3c), optsize=f16(e+20), nsec=f16(e+6);
+  u64 sectbl=(u64)e+24+optsize, limit=0;
+  u32 hdrsize=f32((u64)e+24+60);
+  u64 hdrmap=((u64)hdrsize+0xfff)&~0xfffULL;
+  if(o<hdrmap) limit=hdrmap;
+  for(u32 i=0;i<nsec;i++){
+    u64 s=sectbl+(u64)i*40, va=f32(s+12), span=f32(s+8), raw=f32(s+16), ch=f32(s+36);
+    if(raw>span) span=raw;
+    u64 lim=va+((span+0xfff)&~0xfffULL);
+    if((ch&0x40000000u) && o>=va && o<lim && lim>limit) limit=lim;
+  }
+  return limit>o?(size_t)(limit-o):0;
+}
+static int read_exact(int fd,u8 *buf,size_t len){ size_t done=0; while(done<len){ ssize_t n=read(fd,buf+done,len-done); if(n<0){ if(errno==EINTR) continue; return -1; } if(!n) return -1; done+=(size_t)n; } return 0; }
+static u32 f32(u64 o){ u32 v=0; if(file_range(o,4)) memcpy(&v,g_file+o,4); return v; }
+static u64 f64(u64 o){ u64 v=0; if(file_range(o,8)) memcpy(&v,g_file+o,8); return v; }
+static u16 f16(u64 o){ u16 v=0; if(file_range(o,2)) memcpy(&v,g_file+o,2); return v; }
+static int pe_fail(const char *why){ fprintf(stderr,"[loader] invalid PE: %s\n",why); return -1; }
 
 // ---------- fake TEB / gs ----------
 static u8 g_teb[0x2000];
@@ -198,18 +274,33 @@ static void register_shims(void){
 // ================= PE LOADER =================
 static int load_pe(void){
   int fd=open(g_dllpath,O_RDONLY); if(fd<0){perror("open");return -1;}
-  g_filelen=lseek(fd,0,SEEK_END); lseek(fd,0,SEEK_SET);
-  g_file=malloc(g_filelen); read(fd,g_file,g_filelen); close(fd);
+  off_t flen=lseek(fd,0,SEEK_END);
+  if(flen<0 || lseek(fd,0,SEEK_SET)<0 || (uint64_t)flen<0x40 || (uint64_t)flen>SIZE_MAX){ close(fd); return pe_fail("invalid/truncated file"); }
+  g_filelen=(size_t)flen;
+  g_file=malloc(g_filelen); if(!g_file){ close(fd); return -1; }
+  int read_result=read_exact(fd,g_file,g_filelen); close(fd);
+  if(read_result) return pe_fail("short file read");
+  if(f16(0)!=0x5a4d) return pe_fail("DOS signature");
 
   u32 e=f32(0x3c);
-  g_imagebase=f64(e+24+24);
-  u32 sizeofimage=f32(e+24+56);
-  u32 entry=f32(e+24+16);
-  u16 nsec=f16(e+6);
-  u16 optsize=f16(e+20);
-  u64 sectbl=e+24+optsize;
+  if(!file_range(e,24) || f32(e)!=0x00004550) return pe_fail("PE signature/header");
+  u16 machine=f16(e+4), nsec=f16(e+6), optsize=f16(e+20);
+  u64 opt=(u64)e+24;
+  if(machine!=0x8664 || optsize<112 || !file_range(opt,optsize) || f16(opt)!=0x20b) return pe_fail("expected PE32+ x86-64");
+  u32 sizeofimage=f32(opt+56), hdrsize=f32(opt+60);
+  g_image_size=sizeofimage;
+  g_imagebase=f64(opt+24);
+  u32 entry=f32(opt+16), n_dirs=f32(opt+108);
+  u64 sectbl=opt+optsize;
+  if(!sizeofimage || sizeofimage>0x80000000u || !hdrsize || hdrsize>sizeofimage || hdrsize>g_filelen || !file_range(sectbl,(u64)nsec*40) || entry>=sizeofimage) return pe_fail("invalid image/header/section table size");
+  for(u32 i=0;i<nsec;i++){
+    u64 s=sectbl+(u64)i*40;
+    u32 vaddr=f32(s+12),vsize=f32(s+8),rawsize=f32(s+16),rawptr=f32(s+20);
+    u32 span=vsize>rawsize?vsize:rawsize;
+    if(vaddr>sizeofimage || span>sizeofimage-vaddr || !file_range(rawptr,rawsize)) return pe_fail("section outside file or image");
+  }
 
-  u32 hdrsize=f32(e+24+60); // SizeOfHeaders
+  if(n_dirs>16 || (u64)112+(u64)n_dirs*8>optsize) return pe_fail("data directories exceed optional header");
 
   /* The sidecar is laid out by RVA during installation. Mapping executable
    * pages from this read-only file avoids an executable memfd, which SELinux
@@ -222,6 +313,8 @@ static int load_pe(void){
   int imagefd=open(imagepath,O_RDONLY);
   if(imagefd<0){ perror("open engine image"); free(imagepath); return -1; }
   free(imagepath);
+  struct stat image_stat;
+  if(fstat(imagefd,&image_stat)<0 || image_stat.st_size!=(off_t)sizeofimage){ close(imagefd); return pe_fail("sidecar size does not match SizeOfImage"); }
 
   /* reserve the preferred base, then map each section from the file (W^X-safe) */
   void *m=mmap((void*)g_imagebase,sizeofimage,PROT_NONE,
@@ -231,14 +324,15 @@ static int load_pe(void){
   }
   g_image=m;
   u32 hdrmap=(hdrsize+0xfff)&~0xfffu;
-  if(mmap(g_image,hdrmap,PROT_READ,MAP_PRIVATE|MAP_FIXED,imagefd,0)==MAP_FAILED){
+  if(hdrmap>sizeofimage || mmap(g_image,hdrmap,PROT_READ,MAP_PRIVATE|MAP_FIXED,imagefd,0)==MAP_FAILED){
     perror("[loader] map headers"); close(imagefd); return -1;
   }
   for(int i=0;i<nsec;i++){
-    u64 s=sectbl+i*40;
+    u64 s=sectbl+(u64)i*40;
     u32 vaddr=f32(s+12), vsize=f32(s+8), rawsize=f32(s+16), chars=f32(s+36);
-    u32 seglen=(vsize>rawsize?vsize:rawsize); seglen=(seglen+0xfff)&~0xfffu;
-    if(vaddr+seglen>sizeofimage) seglen=sizeofimage-vaddr;
+    u32 span=(vsize>rawsize?vsize:rawsize);
+    u32 seglen=(span+0xfff)&~0xfffu;
+    if(span>UINT32_MAX-0xfff || vaddr>sizeofimage || seglen>sizeofimage-vaddr){ close(imagefd); return pe_fail("section mapping range overflow"); }
     if(!seglen) continue;
     int prot=PROT_READ;
     if(chars&0x20000000) prot|=PROT_EXEC;   // IMAGE_SCN_MEM_EXECUTE
@@ -250,31 +344,48 @@ static int load_pe(void){
   close(imagefd);
 
   /* Resolve kernel32 imports in the mapped, non-executable IAT. */
-  u32 imprva=f32(e+24+112+8*1);
-  for(u64 d=imprva;;d+=20){
-    u32 orig=*(u32*)(g_image+d), namer=*(u32*)(g_image+d+12), fthunk=*(u32*)(g_image+d+16);
-    if(namer==0) break;
+  u32 imprva=n_dirs>1?f32(opt+112+8):0, impsz=n_dirs>1?f32(opt+112+12):0;
+  if(imprva && (impsz<20 || !image_range(imprva,impsz))){ return pe_fail("import directory outside image"); }
+  u64 d=imprva;
+  int descriptors_terminated=0;
+  for(;imprva && d+20<=((u64)imprva+impsz);d+=20){
+    if(!image_range(d,20)) return pe_fail("import descriptor outside image");
+    u32 orig=*(u32*)(g_image+d), timestamp=*(u32*)(g_image+d+4), chain=*(u32*)(g_image+d+8), namer=*(u32*)(g_image+d+12), fthunk=*(u32*)(g_image+d+16);
+    if(orig==0 && timestamp==0 && chain==0 && namer==0 && fthunk==0){ descriptors_terminated=1; break; }
+    if(namer==0 || fthunk==0) return pe_fail("invalid import descriptor");
+    if(!image_range(namer,1) || !image_range(fthunk,8) || (orig && !image_range(orig,8))) return pe_fail("import name/thunk outside image");
+    /* IAT must be in mapped writable data, never code or a mapping gap. */
+    if(!image_range(fthunk,8) || !image_writable_range(fthunk,8)) return pe_fail("IAT outside writable mapping");
     u64 rt=orig?orig:fthunk;
-    for(int j=0;;j++){
-      u64 ent=*(u64*)(g_image+rt+j*8);
-      if(!ent) break;
-      u64 *slot=(u64*)(g_image+fthunk+j*8);
+    int terminated=0;
+    for(u32 j=0;image_range(rt+(u64)j*8,8) && image_range((u64)fthunk+(u64)j*8,8);j++){
+      u64 ent=*(u64*)(g_image+rt+(u64)j*8);
+      if(!ent){ terminated=1; break; }
+      u64 *slot=(u64*)(g_image+(u64)fthunk+(u64)j*8);
       if(ent>>63){ *slot=0; continue; }
-      const char*fn=(char*)(g_image+(ent&0x7fffffff)+2);
+      u32 irva=(u32)(ent&0x7fffffff);
+      if(!image_range(irva,3)) return pe_fail("import-by-name outside image");
+      const char*fn=(char*)(g_image+irva+2);
+      size_t name_limit=readable_range_length((u64)irva+2);
+      if(!name_limit || !memchr(fn,0,name_limit)) return pe_fail("unterminated import name");
       void*sh=find_shim(fn);
       if(!sh) fprintf(stderr,"[loader] MISSING shim: %s\n",fn);
       *slot=(u64)sh;
     }
+    if(!terminated) return pe_fail("unterminated import thunk array");
   }
+  if(imprva && !descriptors_terminated) return pe_fail("unterminated import descriptor array");
   fprintf(stderr,"[loader] file-backed image at %#lx (no W+X), entry RVA %#x\n",g_imagebase,entry);
 
   // TLS setup (dir 9): copy template, wire teb->tls array
-  u32 tlsrva=f32(e+24+112+8*9);
+  u32 tlsrva=n_dirs>9?f32(opt+112+8*9):0;
   if(tlsrva){
+    if(!image_range(tlsrva,40)) return pe_fail("TLS directory outside image");
     u64 start=*(u64*)(g_image+tlsrva);
     u64 end=*(u64*)(g_image+tlsrva+8);
     u64 idxaddr=*(u64*)(g_image+tlsrva+16);
     u64 cbaddr=*(u64*)(g_image+tlsrva+24);
+    if(end<start || end-start>sizeof g_tls_block || (start && ((u8*)(uintptr_t)start<g_image || (u8*)(uintptr_t)start>=g_image+sizeofimage || end>(u64)(uintptr_t)(g_image+sizeofimage))) || (idxaddr && ((u8*)(uintptr_t)idxaddr<g_image || !image_range((u8*)(uintptr_t)idxaddr-g_image,4)))) return pe_fail("invalid TLS template/index range");
     u64 tlen=end-start;
     memset(g_tls_block,0,sizeof g_tls_block);
     if(tlen) memcpy(g_tls_block,(void*)start,tlen);
@@ -282,7 +393,12 @@ static int load_pe(void){
     if(idxaddr) *(u32*)idxaddr=0;
     fprintf(stderr,"[loader] TLS template %lu bytes, callbacks@%#lx\n",tlen,cbaddr);
     // run TLS callbacks
-    if(cbaddr){ for(u64*cb=(u64*)cbaddr; *cb; cb++){ void(MS *f)(void*,u32,void*)=(void*)*cb; f((void*)g_imagebase,DLL_PROCESS_ATTACH,0);} }
+    if(cbaddr){
+      if((u8*)(uintptr_t)cbaddr<g_image || (u8*)(uintptr_t)cbaddr>=g_image+sizeofimage) return pe_fail("TLS callbacks outside image");
+      u64 cb_rva=(u8*)(uintptr_t)cbaddr-g_image; int term=0;
+      for(u32 i=0;image_range(cb_rva+(u64)i*8,8);i++){ u64 cb=*(u64*)(g_image+cb_rva+(u64)i*8); if(!cb){term=1;break;} if((u8*)(uintptr_t)cb<g_image || (u8*)(uintptr_t)cb>=g_image+sizeofimage) return pe_fail("TLS callback outside image"); void(MS *f)(void*,u32,void*)=(void*)cb; f((void*)g_imagebase,DLL_PROCESS_ATTACH,0); }
+      if(!term) return pe_fail("unterminated TLS callbacks");
+    }
   }
 
   // fake TEB in %gs
@@ -298,6 +414,7 @@ static int load_pe(void){
   // run entry point (DllMain via CRT startup)
   int(MS *DllMain)(void*,u32,void*)=(void*)(g_image+entry);
   fprintf(stderr,"[loader] calling entry (DllMain) ...\n");
+  if(!image_range(entry,1)) return pe_fail("entry point outside image");
   int r=DllMain((void*)g_imagebase,DLL_PROCESS_ATTACH,0);
   fprintf(stderr,"[loader] DllMain returned %d\n",r);
   return r?0:-2;
@@ -305,18 +422,24 @@ static int load_pe(void){
 
 // find an export by name
 static void* get_export(const char*want){
-  u32 e=f32(0x3c);
-  u32 exprva=f32(e+24+112+8*0);
-  u32 nnames=*(u32*)(g_image+exprva+24);
-  u32 fns=*(u32*)(g_image+exprva+28);
-  u32 names=*(u32*)(g_image+exprva+32);
-  u32 ords=*(u32*)(g_image+exprva+36);
+  u32 e=f32(0x3c), opt=e+24;
+  u32 n_dirs=f32(opt+108), exprva=n_dirs?f32(opt+112):0, expsz=n_dirs?f32(opt+116):0;
+  if(!exprva || expsz<40 || !image_range(exprva,40)) return 0;
+  u32 ordinal_base=*(u32*)(g_image+exprva+16), nfns=*(u32*)(g_image+exprva+20);
+  u32 nnames=*(u32*)(g_image+exprva+24), fns=*(u32*)(g_image+exprva+28);
+  u32 names=*(u32*)(g_image+exprva+32), ords=*(u32*)(g_image+exprva+36);
+  if(!image_range(fns,(u64)nfns*4) || !image_range(names,(u64)nnames*4) || !image_range(ords,(u64)nnames*2)) return 0;
   for(u32 i=0;i<nnames;i++){
-    u32 nrva=*(u32*)(g_image+names+i*4);
-    if(!strcmp((char*)(g_image+nrva),want)){
-      u16 ord=*(u16*)(g_image+ords+i*2);
-      u32 frva=*(u32*)(g_image+fns+ord*4);
-      return g_image+frva;
+    u32 nrva=*(u32*)(g_image+(u64)names+(u64)i*4);
+    if(!image_range(nrva,1)) return 0;
+    const char *name=(char*)(g_image+nrva);
+    size_t name_limit=readable_range_length(nrva);
+    if(!name_limit || !memchr(name,0,name_limit)) return 0;
+    if(!strcmp(name,want)){
+      u16 ord=*(u16*)(g_image+(u64)ords+(u64)i*2);
+      if(ord>=nfns || ordinal_base>UINT32_MAX-ord) return 0;
+      u32 frva=*(u32*)(g_image+(u64)fns+(u64)ord*4);
+      return image_range(frva,1)?g_image+frva:0;
     }
   }
   return 0;

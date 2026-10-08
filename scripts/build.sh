@@ -16,6 +16,24 @@ if [ ! -d "$LFP" ]; then
   echo "==> cloning upstream libfprint @ $LIBFPRINT_REF"
   git clone --depth 1 --branch "$LIBFPRINT_REF" \
       https://gitlab.freedesktop.org/libfprint/libfprint.git "$LFP"
+elif [ ! -d "$LFP/.git" ]; then
+  echo "!! $LFP exists but is not a git checkout; refusing to modify it" >&2
+  exit 1
+fi
+
+if ! ACTUAL_REF=$(git -C "$LFP" rev-parse HEAD 2>/dev/null); then
+  echo "!! cannot determine the commit of existing $LFP checkout" >&2
+  exit 1
+fi
+if ! EXPECTED_REF=$(git -C "$LFP" rev-parse "${LIBFPRINT_REF}^{commit}" 2>/dev/null); then
+  echo "!! cannot resolve LIBFPRINT_REF '$LIBFPRINT_REF' in $LFP" >&2
+  echo "   Ensure the requested ref exists locally; checkout contents were not changed." >&2
+  exit 1
+fi
+if [ "$ACTUAL_REF" != "$EXPECTED_REF" ]; then
+  echo "!! existing $LFP checkout is at $ACTUAL_REF, not requested $LIBFPRINT_REF ($EXPECTED_REF)" >&2
+  echo "   Refusing to modify it; checkout contents and user changes were left untouched." >&2
+  exit 1
 fi
 
 echo "==> installing driver files into the tree"

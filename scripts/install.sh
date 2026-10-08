@@ -15,7 +15,8 @@ if [ "${1:-}" = "--uninstall" ]; then
   rm -f "$DROPIN" /usr/lib/libfprint-2/ftWbioEngineAdapter.dll \
     /usr/lib/libfprint-2/ftWbioEngineAdapter.dll.image \
     /etc/udev/rules.d/60-ft9201.rules
-  systemctl daemon-reload || true; systemctl restart fprintd || true
+  systemctl daemon-reload || { echo "!! failed to reload systemd configuration" >&2; exit 1; }
+  systemctl restart fprintd || { echo "!! failed to restart fprintd after uninstall" >&2; exit 1; }
   udevadm control --reload-rules || true
   echo "Uninstalled. The distro libfprint was never modified."
   exit 0
@@ -23,8 +24,8 @@ fi
 
 [ "$(id -u)" = 0 ] || { echo "run with sudo"; exit 1; }
 SO=libfprint/build/libfprint/libfprint-2.so.2.0.0
-[ -f "$SO" ] || { echo "!! build first: scripts/build.sh"; exit 1; }
-[ -f blobs/ftWbioEngineAdapter.dll ] || { echo "!! run scripts/fetch-blobs.sh first"; exit 1; }
+[ -f "$SO" ] || { echo "!! build first: scripts/build.sh" >&2; exit 1; }
+[ -f blobs/ftWbioEngineAdapter.dll ] || { echo "!! run scripts/fetch-blobs.sh first" >&2; exit 1; }
 
 echo "==> installing libfprint (with FT9201) to $DEST"
 install -d "$DEST"
@@ -42,7 +43,8 @@ restorecon -F /usr/lib/libfprint-2/ftWbioEngineAdapter.dll \
 
 echo "==> installing udev rule"
 install -Dm644 packaging/60-ft9201.rules /etc/udev/rules.d/60-ft9201.rules
-udevadm control --reload-rules && udevadm trigger || true
+udevadm control --reload-rules || { echo "!! failed to reload udev rules" >&2; exit 1; }
+udevadm trigger || { echo "!! failed to trigger udev device events" >&2; exit 1; }
 
 echo "==> pointing fprintd at our libfprint (distro libfprint untouched)"
 install -d "$(dirname "$DROPIN")"
@@ -51,8 +53,8 @@ cat > "$DROPIN" <<EOF
 Environment=LD_LIBRARY_PATH=$DEST
 Environment=FT9201_ENGINE_DLL=/usr/lib/libfprint-2/ftWbioEngineAdapter.dll
 EOF
-systemctl daemon-reload
-systemctl restart fprintd || true
+systemctl daemon-reload || { echo "!! failed to reload systemd configuration" >&2; exit 1; }
+systemctl restart fprintd || { echo "!! failed to restart fprintd; installation is in place but the service may still use the old library" >&2; exit 1; }
 
 echo
 echo "Installed. Enroll with:  fprintd-enroll"
