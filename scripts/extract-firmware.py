@@ -80,10 +80,16 @@ def read_firmware(path: Path, nm: str = "nm") -> bytes:
     for i in range(e_shnum):
         off = e_shoff + i * e_shentsize
         sh_type = struct.unpack_from("<I", data, off + 4)[0]
+        sh_flags = struct.unpack_from("<Q", data, off + 8)[0]
         sh_addr, sh_offset, sh_size = struct.unpack_from("<QQQ", data, off + 16)
         if sh_type != 8 and sh_size:  # SHT_NOBITS has no file-backed payload
             if sh_offset > len(data) or sh_size > len(data) - sh_offset:
                 raise _fail(f"section {i} extends past end of ELF file")
+        # Only SHF_ALLOC sections occupy virtual addresses. Non-allocated ones
+        # (.debug_*, .symtab, .comment, ...) have sh_addr 0 and can be large
+        # enough to "contain" any small symbol address.
+        if not sh_flags & 0x2:
+            continue
         if sh_addr <= vaddr and vaddr < sh_addr + sh_size:
             sections.append((sh_addr, sh_offset, sh_size, sh_type))
     if len(sections) != 1:

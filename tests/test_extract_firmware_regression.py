@@ -16,19 +16,28 @@ spec.loader.exec_module(extract)
 
 
 class ExtractFirmwareTests(unittest.TestCase):
-    def make_elf(self, directory: Path) -> Path:
+    SHF_ALLOC = 0x2
+
+    def make_elf(self, directory: Path, debug_section: bool = False) -> Path:
         path = directory / "fixture.so"
-        data = bytearray(512)
+        debug_size = 0x1100 if debug_section else 0
+        data = bytearray(512 + debug_size)
         data[:16] = b"\x7fELF" + bytes((2, 1, 1)) + bytes(9)
         struct.pack_into("<HHI", data, 16, 3, 62, 1)  # ET_DYN, x86-64
         struct.pack_into("<Q", data, 40, 64)  # e_shoff
         struct.pack_into("<HHHHHH", data, 52, 64, 56, 0, 64, 3, 0)
-        # Two valid file-backed sections. Section 1 contains the symbol at VA
-        # 0x1000 + 0x20, backed at file offset 256.
+        if debug_section:
+            # Section 0 as a non-allocated, file-backed section at address 0
+            # (like .debug_info in unstripped libraries) that is large enough
+            # to cover the symbol's address range.
+            struct.pack_into("<IIQQQQIIQQ", data, 64,
+                             0, 1, 0, 0, 512, debug_size, 0, 0, 1, 0)
+        # Two valid file-backed, allocated sections. Section 1 contains the
+        # symbol at VA 0x1000 + 0x20, backed at file offset 256.
         struct.pack_into("<IIQQQQIIQQ", data, 64 + 64,
-                         0, 1, 0, 0x1000, 256, 64, 0, 0, 1, 0)
+                         0, 1, self.SHF_ALLOC, 0x1000, 256, 64, 0, 0, 1, 0)
         struct.pack_into("<IIQQQQIIQQ", data, 64 + 128,
-                         0, 1, 0, 0x2000, 320, 32, 0, 0, 1, 0)
+                         0, 1, self.SHF_ALLOC, 0x2000, 320, 32, 0, 0, 1, 0)
         data[288:296] = b"firmware"
         path.write_bytes(data)
         return path
@@ -52,6 +61,16 @@ class ExtractFirmwareTests(unittest.TestCase):
             self.assertIn("0x66, 0x69, 0x72, 0x6d", header)
             self.assertIn("ft9201_fw_size = 8U", header)
             self.assertEqual(list(output.parent.iterdir()), [output])
+
+    def test_ignores_non_allocated_sections_covering_symbol_address(self):
+        # Regression: the pinned ft9201-static .deb ships an unstripped
+        # libfprint whose .debug_info/.debug_loc start at address 0 and are
+        # larger than the firmware symbol's address, which made extraction
+        # fail with "maps to 3 ELF sections".
+        with tempfile.TemporaryDirectory() as tmp:
+            elf = self.make_elf(Path(tmp), debug_section=True)
+            with mock.patch.object(extract.subprocess, "run", return_value=self.fake_nm()):
+                self.assertEqual(extract.read_firmware(elf), b"firmware")
 
     def test_missing_ambiguous_bad_nm_and_nm_execution_errors(self):
         with tempfile.TemporaryDirectory() as tmp:
