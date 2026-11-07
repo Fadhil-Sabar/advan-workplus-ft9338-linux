@@ -117,6 +117,11 @@ struct _FpiDeviceFt9201
   gboolean  is_identify;      /* identify against the enrolled print gallery */
   gboolean  scan_ok;          /* SCAN_SUBMIT sets TRUE if image was accepted */
 
+  /* System suspend: the finger-wait loop parks itself instead of the
+   * running verify/identify being cancelled. */
+  gboolean  suspend_pending;  /* park the scan loop at its next idle point */
+  gboolean  parked;           /* loop_ssm is parked at SCAN_9338_WAIT_DELAY */
+
   /* Vendor engine (ft_engine): opaque template blob for verify */
   gboolean  engine_ok;        /* engine initialized */
   guint8   *tmpl_blob;        /* committed engine template (verify) */
@@ -940,6 +945,16 @@ scan_ssm_run_state (FpiSsm *ssm, FpDevice *dev)
   switch (fpi_ssm_get_cur_state (ssm))
     {
     case SCAN_9338_WAIT_DELAY:
+      if (self->suspend_pending)
+        {
+          /* Idle between finger polls with no USB transfer in flight: a safe
+           * point to stop. The SSM stays at this state; resume re-enters it. */
+          self->suspend_pending = FALSE;
+          self->parked = TRUE;
+          fp_info ("ft9201: scan loop parked for system suspend");
+          fpi_device_suspend_complete (dev, NULL);
+          break;
+        }
       fpi_ssm_next_state_delayed (ssm, 10);
       break;
     case SCAN_9338_WAIT_FINGER:
@@ -1140,6 +1155,16 @@ scan_ssm_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
 {
   FpiDeviceFt9201 *self = FPI_DEVICE_FT9201 (dev);
   self->loop_ssm = NULL;
+  self->parked = FALSE;
+
+  /* The scan finished before reaching a park point (finger was on the
+   * sensor as suspend began). Acknowledge the suspend so it is not left
+   * hanging; resume will find nothing parked and just carry on. */
+  if (self->suspend_pending)
+    {
+      self->suspend_pending = FALSE;
+      fpi_device_suspend_complete (dev, NULL);
+    }
 
   if (error)
     {
@@ -1335,9 +1360,96 @@ start_scan (FpDevice *dev)
 static void
 dev_cancel (FpDevice *dev)
 {
+  FpiDeviceFt9201 *self = FPI_DEVICE_FT9201 (dev);
+
   /* USB transfers already hold fpi_device_get_cancellable(), so they abort
    * automatically.  The scan SSM will complete with a cancellation error and
-   * fpi_device_{enroll,verify}_complete will propagate it upstream. */
+   * fpi_device_{enroll,verify}_complete will propagate it upstream.
+   * A parked loop has no transfer in flight, so fail it explicitly. */
+  if (self->parked && self->loop_ssm)
+    {
+      self->parked = FALSE;
+      fpi_ssm_mark_failed (self->loop_ssm,
+                           g_error_new_literal (G_IO_ERROR, G_IO_ERROR_CANCELLED,
+                                                "Operation was cancelled"));
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* System suspend / resume                                             */
+/* ------------------------------------------------------------------ */
+
+static void
+dev_suspend (FpDevice *dev)
+{
+  FpiDeviceFt9201 *self = FPI_DEVICE_FT9201 (dev);
+  FpiDeviceAction action = fpi_device_get_current_action (dev);
+
+  /* Only the long-running finger wait of verify/identify is worth keeping
+   * across suspend (lock screen). Enroll gets cancelled as before. */
+  if ((action != FPI_DEVICE_ACTION_VERIFY &&
+       action != FPI_DEVICE_ACTION_IDENTIFY) || !self->loop_ssm)
+    {
+      fpi_device_suspend_complete (dev,
+        fpi_device_error_new (FP_DEVICE_ERROR_NOT_SUPPORTED));
+      return;
+    }
+
+  fp_info ("ft9201: suspend requested, parking scan loop");
+  /* Park at the next finger-poll gap (<= ~10 ms when idle). */
+  self->suspend_pending = TRUE;
+}
+
+static void
+resume_init_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
+{
+  FpiDeviceFt9201 *self = FPI_DEVICE_FT9201 (dev);
+
+  if (error)
+    {
+      fp_warn ("ft9201: re-init after resume failed: %s", error->message);
+      fpi_device_resume_complete (dev, g_error_copy (error));
+      /* libfprint does not cancel the action on resume failure; end the
+       * parked loop so the caller gets an error instead of waiting forever. */
+      if (self->parked && self->loop_ssm)
+        {
+          self->parked = FALSE;
+          fpi_ssm_mark_failed (self->loop_ssm, error);
+        }
+      else
+        g_error_free (error);
+      return;
+    }
+
+  fp_info ("ft9201: sensor re-initialised after resume, continuing scan");
+  fpi_device_resume_complete (dev, NULL);
+  if (self->parked && self->loop_ssm)
+    {
+      self->parked = FALSE;
+      fpi_ssm_jump_to_state (self->loop_ssm, SCAN_9338_WAIT_DELAY);
+    }
+}
+
+static void
+dev_resume (FpDevice *dev)
+{
+  FpiDeviceFt9201 *self = FPI_DEVICE_FT9201 (dev);
+  FpiSsm *ssm;
+
+  if (!self->parked || !self->loop_ssm)
+    {
+      /* Nothing parked (the scan ended during suspend entry). */
+      fpi_device_resume_complete (dev, NULL);
+      return;
+    }
+
+  /* The sensor MCU may have lost power/firmware across s2idle (USB
+   * reset-resume), so run the full open-time init again before polling. */
+  fp_info ("ft9201: resume, re-initialising sensor");
+  self->fw_offset  = 0;
+  self->fw_retries = 0;
+  ssm = fpi_ssm_new (dev, init_ssm_run_state, INIT_NUM_STATES);
+  fpi_ssm_start (ssm, resume_init_complete);
 }
 
 static void
@@ -1478,6 +1590,8 @@ fpi_device_ft9201_class_init (FpiDeviceFt9201Class *klass)
   dev_class->verify  = dev_verify;
   dev_class->identify = dev_identify;
   dev_class->cancel  = dev_cancel;
+  dev_class->suspend = dev_suspend;
+  dev_class->resume  = dev_resume;
 
   fpi_device_class_auto_initialize_features (dev_class);
 }
